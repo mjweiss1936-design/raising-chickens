@@ -12,6 +12,7 @@
             height: 100%;
             background-color: #1a1a1a;
             overflow: hidden;
+            overscroll-behavior: none;
             font-family: 'Courier New', Courier, monospace;
             color: white;
         }
@@ -38,6 +39,11 @@
             height: 100%;
             box-sizing: border-box;
             image-rendering: pixelated;
+            /* mobile: no scrolling, pinch-zoom or double-tap-zoom on the game */
+            touch-action: none;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
         }
         /* Edge to edge when fullscreen -- no border, no rounding */
         #game-container:fullscreen {
@@ -106,11 +112,22 @@
     // Raw (unclamped) pointer, for on-screen buttons up in the sky area
     let rawMouseX = -999, rawMouseY = -999;
 
-    // On-screen music button -- music is OFF until this is pressed (or N)
-    const MUSIC_BTN = { x: 20, y: 118, w: 168, h: 32 };
-    function inMusicBtn(px, py) {
-        return px >= MUSIC_BTN.x && px <= MUSIC_BTN.x + MUSIC_BTN.w &&
-               py >= MUSIC_BTN.y && py <= MUSIC_BTN.y + MUSIC_BTN.h;
+    // On-screen buttons, up in the sky so they never cover the field.
+    // Sized generously: the canvas scales to about half on a landscape phone,
+    // so these need to be big in game units to be a comfortable finger target.
+    const BOLT_BTN  = { x: 20, y: 112, w: 206, h: 62 };
+    const MUSIC_BTN = { x: 20, y: 180, w: 206, h: 58 };
+    function inBtn(b, px, py) {
+        return px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h;
+    }
+    function inMusicBtn(px, py) { return inBtn(MUSIC_BTN, px, py); }
+    function inBoltBtn(px, py) { return inBtn(BOLT_BTN, px, py); }
+    function inAnyBtn(px, py) { return inMusicBtn(px, py) || inBoltBtn(px, py); }
+
+    // Tapping the bolt button does exactly what P does
+    function pressBolt() {
+        if (gameState !== 'playing') return;
+        if (!strikeLightning()) { boltDeny = 45; sndDud(); }
     }
 
     let rabbits = [];
@@ -3361,6 +3378,73 @@
         ctx.fillText('Drop corn AWAY from red zones -- they are all deadly!', 20, 104);
     }
 
+    // Big tappable LIGHTNING button -- the whole reason mobile needs buttons,
+    // since there's no P key on a phone. Shows its own recharge state.
+    function drawBoltButton() {
+        if (gameState !== 'playing') return;
+        let b = BOLT_BTN;
+        let ready = boltCd <= 0;
+        let frac = ready ? 1 : 1 - boltCd / BOLT_COOLDOWN;
+        let hover = inBoltBtn(rawMouseX, rawMouseY);
+        let pulse = 0.5 + Math.sin(frameCount * 0.09) * 0.5;
+        ctx.save();
+
+        // body -- glows when it's ready to fire
+        ctx.fillStyle = ready ? 'rgba(30,70,110,0.92)' : 'rgba(0,0,0,0.5)';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        // recharge fill creeping across
+        if (!ready) {
+            ctx.fillStyle = 'rgba(90,150,200,0.45)';
+            ctx.fillRect(b.x, b.y, b.w * frac, b.h);
+        }
+        ctx.strokeStyle = ready
+            ? (hover ? '#ffffff' : 'rgba(255,235,120,' + (0.65 + 0.35 * pulse) + ')')
+            : 'rgba(255,255,255,0.35)';
+        ctx.lineWidth = ready ? 3 : 2;
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+
+        // lightning bolt icon
+        let ix = b.x + 34, iy = b.y + b.h / 2;
+        ctx.beginPath();
+        ctx.moveTo(ix + 4, iy - 20);
+        ctx.lineTo(ix - 9, iy + 3);
+        ctx.lineTo(ix - 1, iy + 3);
+        ctx.lineTo(ix - 6, iy + 20);
+        ctx.lineTo(ix + 10, iy - 5);
+        ctx.lineTo(ix + 1, iy - 5);
+        ctx.closePath();
+        if (ready) {
+            ctx.fillStyle = '#ffe14d';
+            ctx.shadowColor = '#ffe14d'; ctx.shadowBlur = 12 * pulse;
+        } else {
+            ctx.fillStyle = 'rgba(190,205,220,0.5)';
+        }
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        // label
+        ctx.textAlign = 'left';
+        if (ready) {
+            ctx.font = 'bold 21px "Courier New", monospace';
+            ctx.fillStyle = 'rgba(0,0,0,0.55)';
+            ctx.fillText('ZAP FOX!', b.x + 60, b.y + 32 + 2);
+            ctx.fillStyle = '#ffe14d';
+            ctx.fillText('ZAP FOX!', b.x + 60, b.y + 32);
+            ctx.font = 'bold 11px "Courier New", monospace';
+            ctx.fillStyle = 'rgba(255,255,255,0.7)';
+            ctx.fillText('tap  or press P', b.x + 60, b.y + 50);
+        } else {
+            ctx.font = 'bold 19px "Courier New", monospace';
+            ctx.fillStyle = (boltDeny > 0 && Math.floor(frameCount / 4) % 2 === 0) ? '#ff9090' : '#c8dcec';
+            ctx.fillText('CHARGING', b.x + 60, b.y + 30);
+            ctx.font = 'bold 15px "Courier New", monospace';
+            ctx.fillStyle = '#9fc4dd';
+            ctx.fillText(Math.ceil(boltCd / 60) + 's', b.x + 60, b.y + 49);
+        }
+        ctx.textAlign = 'left';
+        ctx.restore();
+    }
+
     // A proper clickable music button, since a kid won't hunt for a hotkey.
     function drawMusicButton() {
         let b = MUSIC_BTN;
@@ -3789,7 +3873,7 @@
         rawMouseX = p.x; rawMouseY = p.y;
         mouseX = clampX(p.x); mouseY = clampY(p.y);
         // don't aim corn while hovering the music button
-        mouseIn = p.y > horizonY - 10 && !inMusicBtn(p.x, p.y);
+        mouseIn = p.y > horizonY - 10 && !inAnyBtn(p.x, p.y);
     });
     canvas.addEventListener('mouseleave', () => { mouseIn = false; });
     canvas.addEventListener('mousedown', (e) => {
@@ -3797,7 +3881,8 @@
         if (e.button !== 0) return;
         e.preventDefault();
         let p = canvasPos(e);
-        // the music button takes priority over everything else
+        // buttons take priority over everything else
+        if (inBoltBtn(p.x, p.y)) { pressBolt(); return; }
         if (inMusicBtn(p.x, p.y)) { toggleMusic(); return; }
         if (gameState === 'won' || gameState === 'lost') { restartGame(); return; }
         rawMouseX = p.x; rawMouseY = p.y;
@@ -3813,9 +3898,13 @@
         let r = canvas.getBoundingClientRect();
         let rx = (t.clientX - r.left) * (canvas.width / r.width);
         let ry = (t.clientY - r.top) * (canvas.height / r.height);
+        if (inBoltBtn(rx, ry)) { pressBolt(); return; }
         if (inMusicBtn(rx, ry)) { toggleMusic(); return; }
         let x = clampX(rx), y = clampY(ry);
         if (gameState === 'won' || gameState === 'lost') { restartGame(); return; }
+        // show the aiming reticle where they tapped, so the danger warning
+        // is visible on touch devices too (no hover to rely on)
+        rawMouseX = rx; rawMouseY = ry;
         mouseX = x; mouseY = y; mouseIn = true;
         throwCorn(x, y);
     }, { passive: false });
@@ -4074,6 +4163,7 @@
 
         drawTitle();
         drawHUD();
+        drawBoltButton();
         drawMusicButton();
         if (!audioStarted) drawStartGate();
 
