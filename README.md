@@ -18,5 +18,6 @@ Goal: get 11 plump chickens at once and they all march into the coop.
 ## Files
 
 - `index.html` — the game (single self-contained file, no build step)
-- `The_Clumsy_Trot.mp3` — background music
+- `Pasture_Under_the_Rising_Sun.mp3` — background music (off by default)
+- `crazy-chickens.mp3` — takes over while crazy chickens are on the field
 - `farm-game-v2.html`, `farm-game-v3.html`, `chicken-game.html` — earlier versions, kept for posterity

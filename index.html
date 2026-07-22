@@ -192,29 +192,52 @@
     let actx = null, masterGain = null, musicGain = null, sfxGain = null;
     let noiseBuf = null;
 
-    // --- Background music: a real recorded track, OFF by default ---
-    // Press N to put it on. Sound effects are separate and stay on.
-    const MUSIC_FILE = 'The_Clumsy_Trot.mp3';
+    // --- Background music: two real tracks, OFF by default ---
+    // The calm farm tune plays normally. The moment any crazy chickens are on
+    // the field the music switches to their theme, and switches back once
+    // they're gone (e.g. when the bear leads them all away).
+    const MUSIC_CALM  = 'Pasture_Under_the_Rising_Sun.mp3';
+    const MUSIC_CRAZY = 'crazy-chickens.mp3';
     let musicOn = false;              // starts muted, on purpose
-    let musicEl = null;
+    let musicCalmEl = null, musicCrazyEl = null;
+    let musicPlayingEl = null;
+
     function initMusic() {
-        if (musicEl) return;
-        musicEl = new Audio(MUSIC_FILE);
-        musicEl.loop = true;
-        musicEl.volume = 0.45;
-        musicEl.preload = 'none';     // don't fetch 3MB unless they ask for it
+        if (musicCalmEl) return;
+        musicCalmEl = new Audio(MUSIC_CALM);
+        musicCalmEl.loop = true; musicCalmEl.volume = 0.45;
+        musicCalmEl.preload = 'none';   // nothing downloads until music is on
+        musicCrazyEl = new Audio(MUSIC_CRAZY);
+        musicCrazyEl.loop = true; musicCrazyEl.volume = 0.5;
+        musicCrazyEl.preload = 'none';
     }
+
+    // Are there crazy chickens loose right now?
+    function crazyOnTheLoose() {
+        for (let c of chickens) if (c.crazy && !c.dead) return true;
+        return false;
+    }
+
     function updateMusic() {
-        if (!musicEl) return;
+        if (!musicCalmEl) return;
         let want = musicOn && soundOn;
-        if (want && musicEl.paused) {
-            musicEl.preload = 'auto';
-            let p = musicEl.play();
-            if (p && p.catch) p.catch(() => {});   // browser may block; harmless
-        } else if (!want && !musicEl.paused) {
-            musicEl.pause();
+        let target = !want ? null : (crazyOnTheLoose() ? musicCrazyEl : musicCalmEl);
+        // stop anything that shouldn't be playing
+        for (let el of [musicCalmEl, musicCrazyEl]) {
+            if (el !== target && !el.paused) el.pause();
         }
+        if (target) {
+            // starting a different track? take it from the top for the drama
+            if (target !== musicPlayingEl) target.currentTime = 0;
+            if (target.paused) {
+                target.preload = 'auto';
+                let p = target.play();
+                if (p && p.catch) p.catch(() => {});  // browser may block; harmless
+            }
+        }
+        musicPlayingEl = target;
     }
+
     function toggleMusic() {
         initMusic();
         musicOn = !musicOn;
@@ -4087,6 +4110,14 @@
             cornRefillCd = CORN_REFILL_FRAMES;
         }
         if (spaceHeld && gameState === 'playing') throwCorn();
+
+        // Swap between the calm tune and the crazy-chicken theme as they
+        // come and go. Cheap check, a couple of times a second is plenty.
+        if (musicOn && frameCount % 20 === 0) {
+            let wantCrazy = crazyOnTheLoose();
+            if ((wantCrazy && musicPlayingEl !== musicCrazyEl) ||
+                (!wantCrazy && musicPlayingEl !== musicCalmEl)) updateMusic();
+        }
 
         if (boltCd > 0) boltCd--;
         if (denyFlash > 0) denyFlash--;
