@@ -1,0 +1,3909 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feed the Farm - 2.5D</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #1a1a1a;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+            color: white;
+        }
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        /* Fixed 16:9 stage that scales to fill whatever space it's given */
+        #game-container {
+            position: relative;
+            aspect-ratio: 16 / 9;
+            width: min(100vw, calc(100vh * 16 / 9));
+            max-height: 100vh;
+            line-height: 0;
+        }
+        canvas {
+            background-color: #87CEEB;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+            border: 4px solid #333;
+            border-radius: 8px;
+            display: block;
+            width: 100%;
+            height: 100%;
+            box-sizing: border-box;
+            image-rendering: pixelated;
+        }
+        /* Edge to edge when fullscreen -- no border, no rounding */
+        #game-container:fullscreen {
+            margin: auto;
+        }
+        #game-container:fullscreen canvas {
+            border: none;
+            border-radius: 0;
+            box-shadow: none;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas" width="1280" height="720"></canvas>
+</div>
+
+<script>
+    // --- PIXEL RENDER SETUP ---
+    // The whole scene is drawn at logical 800x600 into a half-size buffer, then
+    // blitted back up with smoothing off. Same coordinates, chunky pixels.
+    const canvas = document.getElementById('gameCanvas');
+    const screenCtx = canvas.getContext('2d');
+    const PIXEL = 2;
+
+    const buffer = document.createElement('canvas');
+    buffer.width = canvas.width / PIXEL;
+    buffer.height = canvas.height / PIXEL;
+    const ctx = buffer.getContext('2d');
+
+    const horizonY = 250;
+    const playArea = {
+        minX: 20, maxX: canvas.width - 20,
+        minY: horizonY + 20, maxY: canvas.height - 20
+    };
+
+    // Arrays for all entities
+    let chickens = [];
+    let horses = [];
+    let cows = [];
+    let foxes = [];
+    let eggs = [];
+    let foods = [];
+    let bags = [];
+    let particles = [];
+    let bears = [];
+    let skyBirds = [];
+    let bolts = [];
+    let grasses = [];
+
+    // --- Hazards: these make WHERE you drop the corn the whole game ---
+    let wolves = [];       // hangs about and eats any hen that feeds too close
+    let gators = [];       // lurks at the edge and snaps
+    let farmers = [];      // angry, shoos the flock away
+    let puddles = [];      // mud -- hens get stuck
+    let thorns = [];       // thorn bushes -- hens get stuck and scratched
+    let rainClouds = [];   // drops a puddle then drifts off
+    let stuckLosses = 0;   // (stat) how many times a hen got stuck
+    let nextHazardAt = 60 * 25;
+    let nextRainAt = 60 * 34;
+    let nextThornAt = 60 * 45;
+
+    // Mouse aiming -- corn is placed where you click
+    let mouseX = -999, mouseY = -999, mouseIn = false;
+
+    let rabbits = [];
+    let poops = [];
+
+    // Grass: quick to grow, and only ever one clump in any given small area
+    const GRASS_RATE = 1 / (60 * 9);   // ~9s from sprout to full
+    const GRASS_RIPE = 0.55;           // worth walking over for
+    const GRASS_SPACING = 130;         // no two clumps closer than this
+    const GRASS_MAX = 12;
+    let nextGrassAt = 60 * 2;
+    let cowMeals = 0;
+
+    // Rabbits only bother showing up once the field is worth raiding
+    const RABBIT_THRESHOLD = 3;
+    const RABBIT_MAX = 2;
+    let nextRabbitAt = 60 * 6;
+    let grassStolen = 0;
+
+    const POOP_MAX = 10;
+
+    // Two minutes in, the whole flock lays at once and the yard gets strange
+    const EGG_BOOM_FRAME = 120 * 60;
+    let eggBoomDone = false;
+    const CRAZY_COLORS = ['#ff6bcb', '#7cf0ff', '#ffe14d', '#a6ff6b', '#ff9b54', '#c58bff'];
+
+    // A few minutes in, nothing normal hatches any more. Measured from the
+    // start of the current game so a replay begins fresh, not mid-chaos.
+    const CRAZY_ERA_FRAME = 180 * 60;
+    let crazyEraAnnounced = false;
+    function gameAge() { return frameCount - gameStartFrame; }
+    function crazyEra() { return gameAge() >= CRAZY_ERA_FRAME; }
+
+    // The horse fattens over a whole session, not a couple of bags
+    const HORSE_PLUMP_PER_KERNEL = 0.002; // 500 kernels from lean to boulder
+
+    // Feed a hen enough and she gets fat; fat hens lay whole clutches
+    let FAT_LAY_THRESHOLD = 1.8;
+    const CHICKEN_CAP = 30;
+
+    // Forget to feed them and they starve
+    const HUNGER_WARN = 60 * 55;    // starts looking rough
+    const STARVE_FRAMES = 60 * 90;  // 90s with no corn and it's over
+    let chickensStarved = 0;
+    let crazyDeparted = 0;
+
+    // Rabbit swarm: when the field is overgrown, they strip the lot
+    let swarmCd = 0;
+
+    // ============================================================
+    //  SOUND, MUSIC AND SPEECH
+    //  Everything here is generated in the browser -- no audio files,
+    //  no hosting. Effects are synthesised with Web Audio and the words
+    //  are read aloud with the built-in speech synthesiser.
+    // ============================================================
+
+    let audioStarted = false;
+    let soundOn = true;
+    let hungryNagCd = 0;
+    let actx = null, masterGain = null, musicGain = null, sfxGain = null;
+    let noiseBuf = null;
+
+    function initAudio() {
+        if (audioStarted) return;
+        try {
+            actx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch (e) { return; }
+        if (actx.state === 'suspended') actx.resume();
+
+        masterGain = actx.createGain(); masterGain.gain.value = 0.9;
+        masterGain.connect(actx.destination);
+        musicGain = actx.createGain(); musicGain.gain.value = 0.16; musicGain.connect(masterGain);
+        sfxGain = actx.createGain(); sfxGain.gain.value = 0.55; sfxGain.connect(masterGain);
+
+        // one reusable buffer of white noise for percussive sounds
+        let len = actx.sampleRate * 1.5;
+        noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+        let d = noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+        audioStarted = true;
+        nextNoteTime = actx.currentTime + 0.15;
+        setInterval(musicTick, 60);
+
+    }
+
+    // --- small synth helpers ---
+    function tone(opts) {
+        if (!audioStarted || !soundOn || !actx) return;
+        let t = actx.currentTime + (opts.delay || 0);
+        let o = actx.createOscillator();
+        let g = actx.createGain();
+        o.type = opts.type || 'sine';
+        o.frequency.setValueAtTime(opts.freq, t);
+        if (opts.slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, opts.slideTo), t + opts.dur);
+        if (opts.wobble) {
+            let lfo = actx.createOscillator(), lg = actx.createGain();
+            lfo.frequency.value = opts.wobble; lg.gain.value = opts.wobbleAmt || 12;
+            lfo.connect(lg); lg.connect(o.frequency); lfo.start(t); lfo.stop(t + opts.dur);
+        }
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(opts.vol || 0.25, t + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + opts.dur);
+        o.connect(g); g.connect(opts.bus || sfxGain);
+        o.start(t); o.stop(t + opts.dur + 0.02);
+    }
+
+    function noise(opts) {
+        if (!audioStarted || !soundOn || !actx || !noiseBuf) return;
+        let t = actx.currentTime + (opts.delay || 0);
+        let s = actx.createBufferSource(); s.buffer = noiseBuf;
+        let f = actx.createBiquadFilter();
+        f.type = opts.filterType || 'lowpass';
+        f.frequency.setValueAtTime(opts.freq || 1200, t);
+        if (opts.sweepTo) f.frequency.exponentialRampToValueAtTime(Math.max(40, opts.sweepTo), t + opts.dur);
+        let g = actx.createGain();
+        g.gain.setValueAtTime(opts.vol || 0.3, t);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + opts.dur);
+        s.connect(f); f.connect(g); g.connect(opts.bus || sfxGain);
+        s.start(t); s.stop(t + opts.dur + 0.02);
+    }
+
+    // --- named farmyard sounds ---
+    let sfxCd = {};
+    function throttled(key, frames) {
+        if ((sfxCd[key] || 0) > frameCount) return false;
+        sfxCd[key] = frameCount + frames;
+        return true;
+    }
+
+    function sndCluck() {
+        if (!throttled('cluck', 22)) return;
+        tone({ freq: 900 + Math.random() * 250, slideTo: 420, dur: 0.09, type: 'square', vol: 0.10 });
+        tone({ freq: 620, slideTo: 900, dur: 0.06, type: 'square', vol: 0.07, delay: 0.09 });
+    }
+    function sndPeck() {
+        if (!throttled('peck', 8)) return;
+        noise({ freq: 2600, dur: 0.035, vol: 0.10, filterType: 'bandpass' });
+    }
+    function sndCornLand() {
+        noise({ freq: 900, sweepTo: 180, dur: 0.28, vol: 0.35 });
+        tone({ freq: 150, slideTo: 60, dur: 0.22, type: 'sine', vol: 0.28 });
+    }
+    function sndThunder() {
+        noise({ freq: 5000, sweepTo: 90, dur: 1.5, vol: 0.6 });
+        tone({ freq: 70, slideTo: 32, dur: 1.7, type: 'sawtooth', vol: 0.35 });
+        noise({ freq: 2200, sweepTo: 300, dur: 0.5, vol: 0.3, delay: 0.22 });
+    }
+    function sndMoo() {
+        tone({ freq: 210, slideTo: 150, dur: 0.85, type: 'sawtooth', vol: 0.20, wobble: 5, wobbleAmt: 9 });
+    }
+    function sndNeigh() {
+        tone({ freq: 700, slideTo: 300, dur: 0.55, type: 'sawtooth', vol: 0.17, wobble: 22, wobbleAmt: 55 });
+    }
+    function sndYip() {
+        tone({ freq: 1150, slideTo: 700, dur: 0.13, type: 'square', vol: 0.16 });
+        tone({ freq: 950, slideTo: 620, dur: 0.11, type: 'square', vol: 0.13, delay: 0.15 });
+    }
+    function sndGrowl() {
+        tone({ freq: 95, slideTo: 55, dur: 1.0, type: 'sawtooth', vol: 0.32, wobble: 13, wobbleAmt: 16 });
+    }
+    function sndHatch() {
+        tone({ freq: 1500, slideTo: 2300, dur: 0.10, type: 'triangle', vol: 0.16 });
+        tone({ freq: 2000, slideTo: 2800, dur: 0.09, type: 'triangle', vol: 0.13, delay: 0.11 });
+    }
+    function sndHop() {
+        if (!throttled('hop', 14)) return;
+        tone({ freq: 500, slideTo: 850, dur: 0.07, type: 'sine', vol: 0.09 });
+    }
+    function sndPlop() {
+        noise({ freq: 500, sweepTo: 120, dur: 0.18, vol: 0.22 });
+    }
+    function sndFlap() {
+        if (!throttled('flap', 12)) return;
+        noise({ freq: 700, sweepTo: 300, dur: 0.16, vol: 0.16 });
+    }
+    function sndSparkle() {
+        [0, 0.08, 0.16].forEach((d, i) =>
+            tone({ freq: 900 + i * 350, dur: 0.12, type: 'triangle', vol: 0.13, delay: d }));
+    }
+    function sndDud() { // lightning not charged yet
+        tone({ freq: 220, slideTo: 130, dur: 0.14, type: 'square', vol: 0.10 });
+    }
+    function sndFanfare() { // you win!
+        let notes = [523.25, 659.25, 783.99, 1046.50];
+        notes.forEach((f, i) => {
+            tone({ freq: f, dur: 0.3, type: 'square', vol: 0.16, delay: i * 0.13 });
+            tone({ freq: f * 1.5, dur: 0.3, type: 'triangle', vol: 0.07, delay: i * 0.13 });
+        });
+        tone({ freq: 1046.50, dur: 0.5, type: 'square', vol: 0.16, delay: 0.55 });
+    }
+
+    // --- music: a bouncy little barn-dance tune ---
+    // Melody over an oom-pah bass with kick, snare and hats. 8 bars long so it
+    // doesn't feel like a 4-second loop going round and round.
+    const _ = null;
+    const NT = { C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23, G4: 392.00, A4: 440.00,
+                 B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, F5: 698.46, G5: 783.99 };
+    const N = NT;
+    const TUNE = [
+        // bar 1                                   bar 2
+        N.G4, N.G4, N.A4, N.B4, N.C5, _, N.B4, N.A4,
+        N.G4, _, N.E4, N.G4, N.A4, _, _, _,
+        // bar 3 (over F)                          bar 4 (over G)
+        N.F4, N.F4, N.G4, N.A4, N.B4, _, N.A4, N.G4,
+        N.G4, _, _, _, N.D4, _, N.E4, N.F4,
+        // bar 5                                   bar 6
+        N.G4, N.G4, N.A4, N.B4, N.C5, N.D5, N.E5, N.D5,
+        N.C5, _, N.B4, N.A4, N.G4, _, _, _,
+        // bar 7 (over G)                          bar 8
+        N.A4, N.A4, N.B4, N.C5, N.D5, _, N.C5, N.B4,
+        N.C5, _, _, _, _, _, N.E4, N.F4
+    ];
+    // one chord per bar
+    const CHORDS = [
+        { root: 130.81, triad: [261.63, 329.63, 392.00] }, // C
+        { root: 130.81, triad: [261.63, 329.63, 392.00] }, // C
+        { root: 174.61, triad: [349.23, 440.00, 523.25] }, // F
+        { root: 196.00, triad: [392.00, 493.88, 587.33] }, // G
+        { root: 130.81, triad: [261.63, 329.63, 392.00] }, // C
+        { root: 130.81, triad: [261.63, 329.63, 392.00] }, // C
+        { root: 196.00, triad: [392.00, 493.88, 587.33] }, // G
+        { root: 130.81, triad: [261.63, 329.63, 392.00] }  // C
+    ];
+    const STEP_DUR = 0.20; // eighth notes at 150bpm -- properly bouncy
+    let musicStep = 0, nextNoteTime = 0;
+
+    function kick(d) {
+        tone({ freq: 130, slideTo: 45, dur: 0.16, type: 'sine', vol: 0.5, bus: musicGain, delay: d });
+    }
+    function snare(d) {
+        noise({ freq: 2000, sweepTo: 700, dur: 0.13, vol: 0.20, filterType: 'highpass',
+                bus: musicGain, delay: d });
+    }
+    function hat(d) {
+        noise({ freq: 9000, dur: 0.035, vol: 0.055, filterType: 'highpass',
+                bus: musicGain, delay: d });
+    }
+
+    function musicTick() {
+        if (!audioStarted || !soundOn || !actx) return;
+        while (nextNoteTime < actx.currentTime + 0.3) {
+            let d = nextNoteTime - actx.currentTime;
+            if (d < 0) d = 0;
+            let s = musicStep % TUNE.length;
+            let beat = s % 8;
+            let chord = CHORDS[(s / 8 | 0) % CHORDS.length];
+
+            // melody -- square lead, short and plucky
+            let m = TUNE[s];
+            if (m) {
+                tone({ freq: m, dur: 0.19, type: 'square', vol: 0.13, bus: musicGain, delay: d });
+                tone({ freq: m * 2, dur: 0.12, type: 'triangle', vol: 0.045, bus: musicGain, delay: d });
+            }
+            // oom-pah: root on the beat, chord stab on the off
+            if (beat % 4 === 0) {
+                tone({ freq: chord.root, dur: 0.22, type: 'triangle', vol: 0.30, bus: musicGain, delay: d });
+            } else if (beat % 4 === 2) {
+                chord.triad.forEach(f =>
+                    tone({ freq: f, dur: 0.10, type: 'square', vol: 0.055, bus: musicGain, delay: d }));
+            }
+            // drums
+            if (beat === 0 || beat === 4) kick(d);
+            if (beat === 2 || beat === 6) snare(d);
+            if (beat % 2 === 1) hat(d);
+
+            nextNoteTime += STEP_DUR;
+            musicStep++;
+        }
+    }
+
+    // --- speech: read the words out loud for young players ---
+
+    // Big on-screen event announcement -- always read aloud
+    let banner = null;
+    function showBanner(text, color) {
+        banner = { text: text, color: color, life: 170, maxLife: 170 };
+    }
+
+    // Flies: they turn up for the poop and slowly clear it away
+    let flies = [];
+    const FLY_MAX = 14;
+    const FLY_PER_POOP = 4;
+    const FLY_EAT = 1 / (60 * 14); // one fly clears a pat in ~14s
+    let nextFlyAt = 60 * 4;
+
+    // Timers & score
+    let frameCount = 0;
+    let gameStartFrame = 0;   // reset on replay so timed events restart too
+    let chickensLost = 0;
+    let foxesZapped = 0;
+    let flash = 0;          // white screen flash from a lightning strike
+    let nextBearAt = 60 * (25 + Math.random() * 45);
+    let nextFlockAt = 60 * (5 + Math.random() * 8);
+    const EGG_SPAWN_FRAMES = 60 * 60; // 60 seconds at 60fps
+    const FOX_SPAWN_FRAMES = 38 * 60; // 38s -- eased, the new hazards add pressure
+
+    // Corn "magazine": you hold a few handfuls of corn. Each throw spends one,
+    // and they refill on a timer -- so you can throw a quick burst then must
+    // pace yourself. Holding space feeds at the refill rate, never a flood.
+    const CORN_MAG = 5;               // handfuls you can hold at once
+    const CORN_REFILL_FRAMES = 120;   // one handful back every 2s (~30/min)
+    const CORN_THROW_GAP = 14;        // min frames between throws (caps burst rate)
+    let cornReady = CORN_MAG;
+    let cornRefillCd = CORN_REFILL_FRAMES;
+    let cornThrowCd = 0;
+    let spaceHeld = false;
+    let denyFlash = 0;
+
+    function bagsLeft() { return cornReady; } // kept for HUD compatibility
+
+    // Throw one handful of corn -- at (tx,ty) if given, otherwise wherever the
+    // mouse is, otherwise somewhere random. Rate-limited, so holding or mashing
+    // can never flood the field.
+    function throwCorn(tx, ty) {
+        if (gameState !== 'playing') return false;
+        if (cornThrowCd > 0) return false;
+        if (cornReady <= 0) { denyFlash = 30; return false; }
+        let x, y;
+        if (tx !== undefined) { x = tx; y = ty; }
+        else if (mouseIn) { x = mouseX; y = mouseY; }
+        else {
+            x = playArea.minX + Math.random() * (playArea.maxX - playArea.minX);
+            y = playArea.minY + Math.random() * (playArea.maxY - playArea.minY);
+        }
+        cornReady--;
+        cornThrowCd = CORN_THROW_GAP;
+        bags.push(new CornBag(clampX(x), clampY(y)));
+        return true;
+    }
+
+    // Screen pixels -> the game's logical 1280x720 coordinates
+    function canvasPos(e) {
+        let r = canvas.getBoundingClientRect();
+        return {
+            x: (e.clientX - r.left) * (canvas.width / r.width),
+            y: (e.clientY - r.top) * (canvas.height / r.height)
+        };
+    }
+
+    // Lightning cooldown -- a long recharge so it can't be spammed
+    let boltCd = 0;
+    const BOLT_COOLDOWN = 60 * 14; // 14 seconds
+    let boltDeny = 0;              // flashes when pressed too early
+
+    // ============================================================
+    //  GOAL, SCORE AND WIN STATE
+    //  The point of the game: raise a flock of nice plump chickens.
+    //  You score points for good farming, and you WIN when you have
+    //  enough plump chickens at once -- then they march into the coop.
+    // ============================================================
+    let gameState = 'playing';        // 'playing' | 'winning' | 'won'
+    let score = 0;
+    let scorePop = 0;                 // little bounce when the score jumps
+    // --- Difficulty knobs (mutable so they're easy to tune) ---
+    let PLUMP_THRESHOLD = 1.5;        // a chicken this round counts as "plump"
+    let WIN_PLUMP = 11;               // this many plump chickens at once = you win!
+    let FATTEN_PER_KERNEL = 0.007;    // how much a kernel of corn fattens a hen
+    let METAB_PER_FRAME = 0;          // set >0 to make plump hens slowly burn fat
+    let coop = null;                  // the henhouse, built when you win
+    let confetti = [];
+    let winHoldTimer = 0;
+    let chickensHoused = 0;
+
+    function plumpCount() {
+        let n = 0;
+        for (let c of chickens) {
+            if (c.dead || c.state === 'exodus' || c.state === 'toCoop') continue;
+            if (c.fatness >= PLUMP_THRESHOLD) n++;
+        }
+        return n;
+    }
+    function addScore(n) {
+        if (gameState !== 'playing') return;
+        score += n;
+        scorePop = 1;
+    }
+
+    // Helper Math
+    function dist(x1, y1, x2, y2) {
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        return Math.sqrt(dx * dx + (dy * 2) * (dy * 2)); // perspective distance
+    }
+
+    function clampX(x) { return Math.max(playArea.minX, Math.min(playArea.maxX, x)); }
+    function clampY(y) { return Math.max(playArea.minY, Math.min(playArea.maxY, y)); }
+
+    // Running straight away from a threat is useless when that heading ends in
+    // a fence. Sample headings all round, project each one, clamp it to the
+    // yard, and keep whichever actually ends up furthest from the threat --
+    // so a cornered animal peels off along the fence instead of pinning itself.
+    function pickEscapeTarget(x, y, fromX, fromY, reach) {
+        let best = { x: x, y: y }, bestScore = -Infinity;
+        let base = Math.atan2(y - fromY, x - fromX);
+        for (let i = 0; i < 16; i++) {
+            let a = base + (i / 16) * Math.PI * 2;
+            let tx = clampX(x + Math.cos(a) * reach);
+            let ty = clampY(y + Math.sin(a) * reach * 0.5);
+            // Distance gained from the threat, plus credit for actually moving
+            let score = dist(tx, ty, fromX, fromY) + dist(tx, ty, x, y) * 0.35;
+            if (score > bestScore) { bestScore = score; best = { x: tx, y: ty }; }
+        }
+        return best;
+    }
+
+    // Nearest thing worth running away from. Cows and bears bully everyone.
+    function nearestBully(x, y, range) {
+        let best = null, bestD = range;
+        for (let c of cows) {
+            let d = dist(x, y, c.x, c.y);
+            if (d < bestD) { bestD = d; best = c; }
+        }
+        for (let b of bears) {
+            let d = dist(x, y, b.x, b.y);
+            if (d < bestD) { bestD = d; best = b; }
+        }
+        return best ? { obj: best, d: bestD } : null;
+    }
+
+    function drawShadow(x, y, radiusX, radiusY) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+        ctx.beginPath();
+        ctx.ellipse(x, y, radiusX, radiusY, 0, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // --- PARTICLES (juice) ---
+
+    class Particle {
+        constructor(x, y, opts = {}) {
+            this.x = x; this.y = y;
+            this.z = opts.z || 0;
+            this.vx = opts.vx || 0;
+            this.vy = opts.vy || 0;
+            this.vz = opts.vz || 0;
+            this.gravity = opts.gravity === undefined ? 0.25 : opts.gravity;
+            this.life = opts.life || 30;
+            this.maxLife = this.life;
+            this.color = opts.color || 'white';
+            this.size = opts.size || 3;
+            this.kind = opts.kind || 'dot'; // dot | heart | feather
+            this.spin = Math.random() * Math.PI;
+            this.active = true;
+        }
+        update() {
+            this.x += this.vx;
+            this.y += this.vy;
+            this.z += this.vz;
+            this.vz -= this.gravity;
+            this.spin += 0.15;
+            if (this.z < 0) { this.z = 0; this.vz = 0; this.vx *= 0.7; this.vy *= 0.7; }
+            this.life--;
+            if (this.life <= 0) this.active = false;
+        }
+        draw() {
+            ctx.save();
+            ctx.globalAlpha = Math.max(0, Math.min(1, this.life / this.maxLife));
+            ctx.translate(this.x, this.y - this.z);
+            ctx.fillStyle = this.color;
+
+            if (this.kind === 'heart') {
+                let s = this.size;
+                ctx.beginPath();
+                ctx.arc(-s * 0.4, -s * 0.3, s * 0.5, 0, Math.PI * 2);
+                ctx.arc(s * 0.4, -s * 0.3, s * 0.5, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.moveTo(-s * 0.85, -s * 0.1);
+                ctx.lineTo(s * 0.85, -s * 0.1);
+                ctx.lineTo(0, s);
+                ctx.fill();
+            } else if (this.kind === 'feather') {
+                ctx.rotate(this.spin);
+                ctx.beginPath();
+                ctx.ellipse(0, 0, this.size, this.size * 0.4, 0, 0, Math.PI * 2);
+                ctx.fill();
+            } else {
+                // chunky square = pixel dust
+                ctx.fillRect(-this.size / 2, -this.size / 2, this.size, this.size);
+            }
+            ctx.restore();
+        }
+    }
+
+    function puff(x, y, count, color, spread) {
+        for (let i = 0; i < count; i++) {
+            let a = Math.random() * Math.PI * 2;
+            particles.push(new Particle(x, y, {
+                vx: Math.cos(a) * spread * (0.4 + Math.random()),
+                vy: Math.sin(a) * spread * 0.4 * (0.4 + Math.random()),
+                vz: 1 + Math.random() * 2,
+                gravity: 0.12,
+                life: 25 + Math.random() * 20,
+                color: color,
+                size: 2 + Math.random() * 3
+            }));
+        }
+    }
+
+    function heart(x, y) {
+        particles.push(new Particle(x, y, {
+            z: 20, vz: 1.2, gravity: -0.02, vx: (Math.random() - 0.5) * 0.4,
+            life: 50, color: '#ff5a7a', size: 5, kind: 'heart'
+        }));
+    }
+
+    function featherBurst(x, y) {
+        for (let i = 0; i < 14; i++) {
+            let a = Math.random() * Math.PI * 2;
+            particles.push(new Particle(x, y, {
+                z: 8,
+                vx: Math.cos(a) * (0.5 + Math.random() * 1.5),
+                vy: Math.sin(a) * (0.3 + Math.random()) * 0.6,
+                vz: 1 + Math.random() * 3,
+                gravity: 0.07,
+                life: 50 + Math.random() * 30,
+                color: Math.random() > 0.3 ? '#ffffff' : '#ffe9a8',
+                size: 3 + Math.random() * 3,
+                kind: 'feather'
+            }));
+        }
+    }
+
+    // --- ENTITIES ---
+
+    class CornBag {
+        constructor(x, y) {
+            this.x = x; this.y = y; this.z = 400;
+            this.vz = -2; this.gravity = 0.4;
+            this.active = true;
+        }
+        update() {
+            this.vz -= this.gravity; this.z += this.vz;
+            if (this.z <= 0) { this.z = 0; this.burst(); }
+        }
+        burst() {
+            this.active = false;
+            sndCornLand();
+            sndCluck();
+            puff(this.x, this.y, 18, '#c9b184', 3.2);
+            // Fling the kernels outwards -- they arc, bounce and roll to a stop
+            for (let i = 0; i < 26; i++) {
+                let angle = Math.random() * Math.PI * 2;
+                let power = 1.5 + Math.random() * 4.5;
+                foods.push(new Food(this.x, this.y, {
+                    vx: Math.cos(angle) * power,
+                    vy: Math.sin(angle) * power * 0.45,
+                    vz: 1.5 + Math.random() * 3
+                }));
+            }
+        }
+        draw() {
+            let sScale = Math.max(0.1, 1 - (this.z / 400));
+            drawShadow(this.x, this.y, 15 * sScale, 6 * sScale);
+            ctx.save();
+            ctx.translate(this.x, this.y - this.z);
+            ctx.fillStyle = '#8b5a2b';
+            ctx.beginPath(); ctx.moveTo(-12, 15); ctx.lineTo(12, 15); ctx.lineTo(15, -10); ctx.lineTo(-15, -10); ctx.fill();
+            ctx.fillStyle = '#6b4423';
+            ctx.beginPath(); ctx.moveTo(-8, -10); ctx.lineTo(8, -10); ctx.lineTo(12, -18); ctx.lineTo(-12, -18); ctx.fill();
+            ctx.fillStyle = '#eaddca'; ctx.fillRect(-6, -2, 12, 8);
+            ctx.restore();
+        }
+    }
+
+    class Food {
+        constructor(x, y, opts = {}) {
+            this.x = x; this.y = y;
+            this.z = 0;
+            this.vx = opts.vx || 0;
+            this.vy = opts.vy || 0;
+            this.vz = opts.vz || 0;
+            this.landed = !(this.vx || this.vy || this.vz);
+            this.consumed = false;
+            this.claimedBy = null; // only one chicken may chase a given kernel
+        }
+        update() {
+            if (this.landed) return;
+            this.x += this.vx;
+            this.y += this.vy;
+            this.z += this.vz;
+            this.vz -= 0.35;
+            if (this.z <= 0) {
+                this.z = 0;
+                if (Math.abs(this.vz) > 1.2) {
+                    // one lively bounce
+                    this.vz *= -0.35; this.vx *= 0.5; this.vy *= 0.5;
+                } else {
+                    this.landed = true; this.vx = this.vy = this.vz = 0;
+                }
+            }
+            this.x = clampX(this.x);
+            this.y = clampY(this.y);
+        }
+        draw() {
+            if (this.z > 0.5) drawShadow(this.x, this.y, 3, 1.5);
+            ctx.fillStyle = '#ffcc00';
+            ctx.beginPath(); ctx.ellipse(this.x, this.y - this.z, 4, 2, 0, 0, Math.PI * 2); ctx.fill();
+        }
+    }
+
+    class Egg {
+        constructor(x, y) {
+            this.x = clampX(x); this.y = clampY(y);
+            this.maxTimer = 240; // 4 seconds to hatch
+            this.timer = this.maxTimer;
+            this.active = true;
+            this.crazy = false;
+        }
+        update() {
+            this.timer--;
+            if (this.timer <= 0) {
+                this.active = false;
+                sndHatch();
+                addScore(50); // a new chick joins the flock
+                puff(this.x, this.y, 10, this.crazy ? '#ffd6f5' : '#fffaf0', this.crazy ? 2.4 : 1.6);
+                chickens.push(new Chicken(this.x, this.y, 0.4, this.crazy)); // Start tiny!
+            }
+        }
+        draw() {
+            drawShadow(this.x, this.y, 6, 3);
+            // Wobble harder the closer it is to hatching
+            let urgency = 1 - (this.timer / this.maxTimer);
+            let wob = Math.sin(this.timer * 0.4) * 0.25 * urgency;
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.rotate(wob);
+            ctx.fillStyle = '#fffaf0';
+            ctx.beginPath(); ctx.ellipse(0, -6, 5, 7, 0, 0, Math.PI * 2); ctx.fill();
+            // Crack shows up right before it pops
+            if (urgency > 0.6) {
+                ctx.strokeStyle = '#c9b184'; ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(-4, -7); ctx.lineTo(-1, -5); ctx.lineTo(1, -8); ctx.lineTo(4, -6);
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+    }
+
+    class Chicken {
+        constructor(x, y, fatness = 1.0, crazy = false) {
+            this.x = clampX(x); this.y = clampY(y);
+            this.facingDir = Math.random() > 0.5 ? 1 : -1;
+            this.baseSpeed = 1.5 + Math.random();
+            this.baseSize = 13; // trimmed so hens read small next to the horse
+            this.crazy = crazy;
+            if (crazy) {
+                this.baseSpeed *= 1.7;
+                this.bodyColor = CRAZY_COLORS[Math.floor(Math.random() * CRAZY_COLORS.length)];
+                this.wobble = Math.random() * Math.PI * 2;
+            }
+            this.fatness = fatness; // < 1 = baby, 1 = normal, > 1 = fat
+            this.dead = false;
+
+            this.state = 'wander';
+            this.targetFood = null;
+            this.timer = Math.random() * 60;
+            this.walkCycle = 0;
+            this.peckCycle = 0;
+            this.alarm = 0;
+
+            // Airborne state, for the panicked hop-flutter away from the cow
+            this.z = 0;
+            this.vz = 0;
+            this.flyVx = 0;
+            this.flyVy = 0;
+            this.wingCycle = 0;
+            this.flutterCd = 0;
+            this.faceCd = 0;
+            this.layCd = 0;
+            this.hunger = 0;
+            this.stuck = 0;      // frames left stuck in mud / thorns
+            this.stuckKind = '';
+            this.stuckZone = null;
+            this.stuckImmune = 0;
+            this.countedPlump = fatness >= PLUMP_THRESHOLD;
+
+            // Each bird keeps its own patch of yard and mooches around it, so
+            // the flock spreads out instead of orbiting one spot.
+            this.homeX = this.x;
+            this.homeY = this.y;
+            this.roam = 90 + Math.random() * 70;
+        }
+
+        get size() { return this.baseSize * this.fatness; }
+
+        releaseFood() {
+            if (this.targetFood && this.targetFood.claimedBy === this) this.targetFood.claimedBy = null;
+            this.targetFood = null;
+        }
+
+        // Off with the bear, never to return
+        startExodus(dirX) {
+            this.state = 'exodus';
+            this.z = Math.max(this.z, 2);
+            this.vz = 2.2 + Math.random() * 1.2;
+            this.flyVx = dirX * (2.8 + Math.random() * 1.8);
+            this.flyVy = -0.2 - Math.random() * 0.5;
+            this.facingDir = dirX > 0 ? 1 : -1;
+            this.alarm = 0;
+            this.releaseFood();
+            puff(this.x, this.y, 7, '#ffd6f5', 1.8);
+        }
+
+        // A well-fed hen drops a whole clutch, then slims back down. This is
+        // the loop: more corn -> fatter birds -> more eggs -> more birds.
+        layClutch() {
+            let room = CHICKEN_CAP - chickens.length - eggs.length;
+            if (room <= 0) { this.layCd = 60 * 5; return; }
+            let n = Math.min(room, 3 + Math.floor(Math.random() * 3));
+            for (let i = 0; i < n; i++) {
+                let a = Math.random() * Math.PI * 2;
+                let r = 12 + Math.random() * 24;
+                let e = new Egg(this.x + Math.cos(a) * r, this.y + Math.sin(a) * r * 0.5);
+                e.crazy = crazyEra();
+                eggs.push(e);
+            }
+            this.fatness = Math.max(1.0, this.fatness - 0.45);
+            this.countedPlump = this.fatness >= PLUMP_THRESHOLD; // can earn it again
+            this.layCd = 60 * 8;
+            addScore(30); // laying a nest is good farming
+            puff(this.x, this.y, 9, '#fff3c4', 1.6);
+            heart(this.x, this.y - this.size);
+            sndCluck();
+        }
+
+        // Chickens can't really fly, but they can panic upwards for a moment.
+        // Crazy birds do it unprovoked, so the alarm marker is optional.
+        flutter(fromX, fromY, spooked = true) {
+            let a = Math.atan2(this.y - fromY, this.x - fromX);
+            let power = 3.2 + Math.random();
+            this.vz = 4.5 + Math.random() * 1.5;
+            this.flyVx = Math.cos(a) * power;
+            this.flyVy = Math.sin(a) * power * 0.5;
+            this.facingDir = this.flyVx > 0 ? 1 : -1;
+            this.faceCd = 20;
+            this.flutterCd = spooked ? 110 : 40;
+            sndFlap();
+            this.state = 'flee';
+            if (spooked) this.alarm = 45;
+            this.releaseFood();
+            puff(this.x, this.y, 6, '#d8e2c4', 1.5);
+            for (let i = 0; i < 5; i++) {
+                particles.push(new Particle(this.x, this.y, {
+                    z: 6, vx: (Math.random() - 0.5) * 1.6, vy: (Math.random() - 0.5) * 0.8,
+                    vz: 1 + Math.random() * 2, gravity: 0.06, life: 45,
+                    color: '#ffffff', size: 3, kind: 'feather'
+                }));
+            }
+        }
+
+        // Personal space. Push apart from anyone standing too close, weighted
+        // by how badly they overlap so it fades to zero at the edge (no jitter).
+        separate() {
+            let sx = 0, sy = 0, n = 0;
+            let myR = 16 + this.size * 0.7;
+            for (let o of chickens) {
+                if (o === this || o.dead) continue;
+                let dx = this.x - o.x;
+                let dy = (this.y - o.y) * 2; // perspective: depth counts double
+                let d2 = dx * dx + dy * dy;
+                let r = myR + o.size * 0.7;
+                if (d2 > 0.01 && d2 < r * r) {
+                    let d = Math.sqrt(d2);
+                    let w = 1 - d / r;
+                    sx += (dx / d) * w;
+                    sy += (dy / d) * w;
+                    n++;
+                }
+            }
+            if (n === 0) return;
+            // Shove less while eating, so a bird isn't nudged off its kernel
+            let push = (this.state === 'peck') ? 0.3 : 0.9;
+            this.x = clampX(this.x + sx * push);
+            this.y = clampY(this.y + sy * push * 0.5);
+        }
+
+        update() {
+            // Victory parade: waddle to the coop and pop inside
+            if (this.state === 'toCoop') {
+                if (!coop) { this.state = 'wander'; return; }
+                let dx = coop.doorX - this.x, dy = coop.doorY - this.y;
+                let d = Math.hypot(dx, dy);
+                this.walkCycle += 0.3;
+                if (d < 10) {
+                    // in you go!
+                    this.dead = true;
+                    chickensHoused++;
+                    puff(coop.doorX, coop.doorY, 8, '#fff2c8', 1.4);
+                    spawnConfetti(14);
+                    sndCluck();
+                } else {
+                    let sp = 1.8;
+                    this.x += (dx / d) * sp;
+                    this.y += (dy / d) * sp;
+                    if (dx > 1) this.facingDir = 1; else if (dx < -1) this.facingDir = -1;
+                }
+                return;
+            }
+            // Leaving for good -- climb away and don't come back
+            if (this.state === 'exodus') {
+                this.z += this.vz;
+                this.vz = Math.min(this.vz + 0.04, 4.5);
+                this.x += this.flyVx;
+                this.y += this.flyVy;
+                this.wingCycle += 1.0;
+                if (this.x < -90 || this.x > canvas.width + 90 || this.z > 420) {
+                    this.dead = true;
+                    crazyDeparted++;
+                }
+                return;
+            }
+
+            // Chicks grow to full size on their own. Past 1.0 you only get
+            // fatter by eating, and it is deliberately glacial.
+            if (this.fatness < 1) this.fatness = Math.min(1, this.fatness + 0.0005);
+            if (this.layCd > 0) this.layCd--;
+
+            // Metabolism: a plump hen slowly burns fat back toward normal, so
+            // you have to keep the whole flock fed to hold them all plump at once.
+            if (this.fatness > 1.0) this.fatness = Math.max(1.0, this.fatness - METAB_PER_FRAME);
+
+            // Stuck in the mud or a thorn bush -- struggle until free.
+            // Still gets hungry, and is easy pickings while stuck.
+            if (this.stuck > 0) {
+                this.stuck--;
+                this.hunger++;
+                this.walkCycle += 0.4;
+                if (this.stuck % 14 === 0) {
+                    puff(this.x, this.y + 2, 2,
+                        this.stuckKind === 'thorn' ? '#3d5c33' : '#5b4a33', 0.7);
+                }
+                if (this.stuck <= 0) {
+                    // Scramble clear of the patch -- otherwise she is standing
+                    // in it still and would re-stick forever.
+                    let z = this.stuckZone;
+                    if (z) {
+                        let a = Math.atan2(this.y - z.y, this.x - z.x);
+                        if (!isFinite(a) || (this.x === z.x && this.y === z.y)) a = Math.random() * Math.PI * 2;
+                        this.x = clampX(z.x + Math.cos(a) * (z.r + 18));
+                        this.y = clampY(z.y + Math.sin(a) * (z.r * 0.6 + 12));
+                    }
+                    this.stuckImmune = 110;   // a moment to get away
+                    this.stuckZone = null;
+                    this.releaseFood(); this.state = 'wander'; this.timer = 10;
+                }
+                return;
+            }
+            // Wandered into mud or thorns?
+            if (this.stuckImmune > 0) this.stuckImmune--;
+            else {
+                for (let z of stickZones()) {
+                    if (dist(this.x, this.y, z.x, z.y) < z.r) {
+                        this.stuck = 60 * (1.8 + Math.random() * 1.2);
+                        this.stuckZone = z;
+                        this.stuckKind = (thorns.some(t => t.x === z.x && t.y === z.y)) ? 'thorn' : 'mud';
+                        if (this.stuckKind === 'thorn' && this.fatness > 1.0) this.fatness = Math.max(1.0, this.fatness - 0.04);
+                        this.alarm = 25;
+                        stuckLosses++;
+                        puff(this.x, this.y, 5, this.stuckKind === 'thorn' ? '#3d5c33' : '#5b4a33', 1.2);
+                        return;
+                    }
+                }
+            }
+
+            // Hunger. Corn resets it; neglect kills.
+            this.hunger++;
+            if (this.hunger > HUNGER_WARN && this.fatness > 0.55) this.fatness -= 0.0007;
+            if (this.hunger > STARVE_FRAMES) {
+                this.dead = true;
+                chickensStarved++;
+                featherBurst(this.x, this.y);
+                puff(this.x, this.y, 5, '#9a9a9a', 1.0);
+                return;
+            }
+
+            this.separate();
+
+            if (this.faceCd > 0) this.faceCd--;
+            if (this.flutterCd > 0) this.flutterCd--;
+
+            // --- Airborne: nothing else matters until we land ---
+            if (this.z > 0 || this.vz > 0) {
+                this.z += this.vz;
+                this.vz -= 0.45;
+                this.x = clampX(this.x + this.flyVx);
+                this.y = clampY(this.y + this.flyVy);
+                this.flyVx *= 0.97;
+                this.flyVy *= 0.97;
+                this.wingCycle += 0.9;
+                if (this.z <= 0) {
+                    this.z = 0; this.vz = 0; this.flyVx = 0; this.flyVy = 0;
+                    puff(this.x, this.y, 5, '#c9d8a8', 1.2);
+                    this.state = 'flee';
+                }
+                if (this.alarm > 0) this.alarm--;
+                return;
+            }
+
+            // Crazy birds go off like popcorn, for no reason whatsoever
+            if (this.crazy) {
+                this.wobble += 0.3;
+                if (this.flutterCd <= 0 && Math.random() < 0.006) {
+                    this.flutter(this.x - (Math.random() - 0.5) * 60,
+                                 this.y - (Math.random() - 0.5) * 60, false);
+                    return;
+                }
+            }
+
+            // Cow or bear about to trample us? Get airborne.
+            if (this.flutterCd <= 0) {
+                let bully = nearestBully(this.x, this.y, 90);
+                if (bully) { this.flutter(bully.obj.x, bully.obj.y); return; }
+            }
+
+            let currentSpeed = this.baseSpeed / Math.max(0.5, this.fatness);
+            let isMoving = false;
+
+            // Check for threats (Cow or Fox)
+            let nearestThreatDist = Infinity;
+            let threatX = 0, threatY = 0;
+
+            for (let f of foxes) {
+                let d = dist(this.x, this.y, f.x, f.y);
+                if (d < 180 && d < nearestThreatDist) { nearestThreatDist = d; threatX = f.x; threatY = f.y; }
+            }
+            for (let c of cows) {
+                let d = dist(this.x, this.y, c.x, c.y);
+                if (d < 130 && d < nearestThreatDist) { nearestThreatDist = d; threatX = c.x; threatY = c.y; }
+            }
+            for (let b of bears) {
+                let d = dist(this.x, this.y, b.x, b.y);
+                if (d < 220 && d < nearestThreatDist) { nearestThreatDist = d; threatX = b.x; threatY = b.y; }
+            }
+            // The angry farmer just shoos -- but he shoos hard
+            for (let f of farmers) {
+                let d = dist(this.x, this.y, f.x, f.y);
+                if (d < f.scareR && d < nearestThreatDist) { nearestThreatDist = d; threatX = f.x; threatY = f.y; }
+            }
+            // Wolves and gators: a hen keeps her distance on her own... unless
+            // there is corn to be had. Greed beats fear -- that is the whole
+            // point of choosing where to drop it.
+            let chasingFood = (this.state === 'seek' && this.targetFood && !this.targetFood.consumed);
+            if (!chasingFood) {
+                for (let z of killZones()) {
+                    let d = dist(this.x, this.y, z.x, z.y);
+                    if (d < z.scare && d < nearestThreatDist) { nearestThreatDist = d; threatX = z.x; threatY = z.y; }
+                }
+            }
+
+            if (nearestThreatDist < 220) {
+                this.state = 'flee';
+                this.releaseFood();
+                this.alarm = 20;
+                let esc = pickEscapeTarget(this.x, this.y, threatX, threatY, 120);
+                this.moveTo(esc.x, esc.y, currentSpeed * 1.6);
+                this.walkCycle += 0.35 * currentSpeed;
+                return;
+            } else if (this.state === 'flee') {
+                this.state = 'wander'; // Safe now
+            }
+            if (this.alarm > 0) this.alarm--;
+
+            if (this.state === 'peck') {
+                this.peckCycle--;
+                if (this.peckCycle <= 0) {
+                    if (this.targetFood && !this.targetFood.consumed) {
+                        this.targetFood.consumed = true;
+                        this.hunger = 0; // fed
+                        sndPeck();
+                        if (Math.random() < 0.10) sndCluck();
+                        addScore(2); // a little something for every bite
+                        // Get fatter -- very, very slowly. Cap at 2.2
+                        if (this.fatness < 2.4) this.fatness += FATTEN_PER_KERNEL;
+                        if (Math.random() < 0.15) heart(this.x, this.y - this.size);
+                        // First time it crosses into "plump" -- a big reward, this
+                        // is what the whole game is about.
+                        if (!this.countedPlump && this.fatness >= PLUMP_THRESHOLD) {
+                            this.countedPlump = true;
+                            addScore(150);
+                            sndSparkle();
+                            for (let k = 0; k < 4; k++) heart(this.x + (Math.random() - 0.5) * 20, this.y - this.size);
+                        }
+                        // Plump enough? Time to lay.
+                        if (this.fatness >= FAT_LAY_THRESHOLD && this.layCd <= 0) this.layClutch();
+                    }
+                    this.state = 'wander'; this.targetFood = null; this.timer = 20;
+                }
+                return;
+            }
+
+            if (this.state === 'wander') {
+                // Go for the nearest kernel nobody else has called dibs on
+                let closest = null; let minDist = Infinity;
+                for (let f of foods) {
+                    if (f.consumed) continue;
+                    if (f.claimedBy && f.claimedBy !== this && !f.claimedBy.dead) continue;
+                    let d = dist(this.x, this.y, f.x, f.y);
+                    // small random tiebreak so equidistant birds don't all agree
+                    d *= 0.85 + Math.random() * 0.3;
+                    if (d < 400 && d < minDist) { minDist = d; closest = f; }
+                }
+
+                if (closest) {
+                    this.targetFood = closest;
+                    closest.claimedBy = this;
+                    this.state = 'seek';
+                } else {
+                    this.timer--;
+                    if (this.timer <= 0) {
+                        // Now and then, up sticks and move the whole home range
+                        if (Math.random() < 0.12) {
+                            this.homeX = playArea.minX + Math.random() * (playArea.maxX - playArea.minX);
+                            this.homeY = playArea.minY + Math.random() * (playArea.maxY - playArea.minY);
+                        }
+                        let a = Math.random() * Math.PI * 2;
+                        let r = Math.random() * this.roam * (this.crazy ? 1.6 : 1);
+                        this.tX = clampX(this.homeX + Math.cos(a) * r);
+                        this.tY = clampY(this.homeY + Math.sin(a) * r * 0.5);
+                        // crazy birds change their minds constantly
+                        this.timer = this.crazy ? 12 + Math.random() * 22 : 50 + Math.random() * 70;
+                    }
+                    if (this.tX !== undefined) { isMoving = this.moveTo(this.tX, this.tY, currentSpeed); }
+                }
+            }
+
+            if (this.state === 'seek') {
+                if (!this.targetFood || this.targetFood.consumed) {
+                    this.state = 'wander'; this.releaseFood();
+                } else {
+                    let d = dist(this.x, this.y, this.targetFood.x, this.targetFood.y);
+                    if (d <= 8) {
+                        this.state = 'peck'; this.peckCycle = 15;
+                    } else {
+                        isMoving = this.moveTo(this.targetFood.x, this.targetFood.y, currentSpeed);
+                    }
+                }
+            }
+
+            this.walkCycle = isMoving ? this.walkCycle + 0.2 * currentSpeed : 0;
+        }
+
+        // Returns true only if we actually covered ground, so the walk cycle
+        // can't keep running while the bird is standing still.
+        moveTo(tx, ty, speed) {
+            let dx = tx - this.x; let dy = ty - this.y;
+            let d = Math.sqrt(dx * dx + dy * dy);
+            let moved = false;
+            if (d > 1) {
+                this.x += (dx / d) * speed;
+                this.y += (dy / d) * (speed * 0.7);
+                moved = true;
+            }
+            this.face(dx);
+
+            this.x = clampX(this.x);
+            this.y = clampY(this.y);
+            return moved;
+        }
+
+        // Turning needs a deadzone and a cooldown, otherwise a bird wedged
+        // against the fence flips left/right every single frame.
+        face(dx) {
+            if (this.faceCd > 0) return;
+            let want = dx > 3 ? 1 : (dx < -3 ? -1 : 0);
+            if (want !== 0 && want !== this.facingDir) {
+                this.facingDir = want;
+                this.faceCd = 12;
+            }
+        }
+
+        draw() {
+            let size = this.size;
+            let lift = this.z;
+            let sScale = 1 / (1 + lift * 0.02);
+            drawShadow(this.x, this.y, size * 0.8 * sScale, size * 0.3 * sScale);
+
+            ctx.save();
+            ctx.translate(this.x, this.y - lift);
+            ctx.scale(this.facingDir, 1);
+
+            if (this.state === 'peck') {
+                ctx.rotate(Math.sin((this.peckCycle / 15) * Math.PI) * (Math.PI / 4));
+            }
+            // struggling to get free -- rock side to side
+            if (this.stuck > 0) ctx.rotate(Math.sin(this.walkCycle * 1.6) * 0.28);
+            ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 3);
+
+            // Legs (grounded stride only -- airborne legs are drawn dangling below)
+            if (lift === 0) {
+                ctx.strokeStyle = '#ffa500'; ctx.lineWidth = 2; ctx.beginPath();
+                let ls1 = Math.sin(this.walkCycle) * 5; let ls2 = Math.sin(this.walkCycle + Math.PI) * 5;
+                ctx.moveTo(-size * 0.2, size * 0.3); ctx.lineTo(-size * 0.2 + ls1, size * 0.8);
+                ctx.moveTo(size * 0.2, size * 0.3); ctx.lineTo(size * 0.2 + ls2, size * 0.8);
+                ctx.stroke();
+            }
+
+            // Wings beating hard while airborne
+            if (lift > 0) {
+                let f = Math.sin(this.wingCycle) * 14;
+                ctx.fillStyle = '#fbfbfb';
+                ctx.strokeStyle = '#dddddd'; ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(-size * 0.1, -size * 0.25);
+                ctx.lineTo(-size * 0.7, -size * 0.5 - f);
+                ctx.lineTo(size * 0.35, -size * 0.15 - f * 0.4);
+                ctx.closePath(); ctx.fill(); ctx.stroke();
+                // legs dangle rather than stride
+                ctx.strokeStyle = '#ffa500'; ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(-size * 0.2, size * 0.3); ctx.lineTo(-size * 0.35, size * 0.9);
+                ctx.moveTo(size * 0.2, size * 0.3); ctx.lineTo(size * 0.05, size * 0.9);
+                ctx.stroke();
+            }
+
+            // Wings out when running for your life
+            if (this.state === 'flee' && lift === 0) {
+                let flap = Math.sin(this.walkCycle * 2) * 6;
+                ctx.fillStyle = '#f2f2f2';
+                ctx.beginPath();
+                ctx.moveTo(-size * 0.2, -size * 0.2);
+                ctx.lineTo(-size * 0.9, -size * 0.5 - flap);
+                ctx.lineTo(-size * 0.3, size * 0.2);
+                ctx.fill();
+            }
+
+            // Body
+            ctx.fillStyle = this.crazy ? this.bodyColor
+                : (this.fatness < 0.6 ? '#fff5cc' : '#ffffff'); // Baby is yellowish
+            ctx.strokeStyle = this.crazy ? 'rgba(0,0,0,0.3)' : '#dddddd'; ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(size, 0); ctx.lineTo(-size * 0.8, -size * 0.7); ctx.lineTo(-size * 0.6, size * 0.5);
+            ctx.closePath(); ctx.fill(); ctx.stroke();
+
+            // Beak
+            ctx.fillStyle = '#ffa500'; ctx.beginPath();
+            ctx.moveTo(size - 2, -2); ctx.lineTo(size + 8 * this.fatness, 2); ctx.lineTo(size - 2, 6);
+            ctx.fill();
+
+            // Comb/Wattle (Only if grown). Crazy birds get a ridiculous mohawk.
+            if (this.fatness >= 0.8) {
+                ctx.fillStyle = '#cc0000'; ctx.beginPath();
+                ctx.moveTo(size - 8, -size * 0.4); ctx.lineTo(size - 4, -size * 0.8); ctx.lineTo(size, -size * 0.3); ctx.fill();
+                ctx.beginPath(); ctx.arc(size - 4, 6, 3 * this.fatness, 0, Math.PI * 2); ctx.fill();
+                if (this.crazy) {
+                    for (let i = 0; i < 3; i++) {
+                        let bx = size - 12 + i * 5;
+                        let flop = Math.sin(this.wobble + i) * 3;
+                        ctx.beginPath();
+                        ctx.moveTo(bx, -size * 0.4);
+                        ctx.lineTo(bx + 2 + flop, -size * 1.25);
+                        ctx.lineTo(bx + 5, -size * 0.35);
+                        ctx.fill();
+                    }
+                }
+            }
+
+            // Eye -- googly and rolling if this one is unhinged
+            if (this.crazy) {
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath(); ctx.arc(size - 6, -2, 3.4, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = 'black';
+                ctx.beginPath();
+                ctx.arc(size - 6 + Math.cos(this.wobble * 1.7) * 1.5,
+                        -2 + Math.sin(this.wobble * 2.3) * 1.5, 1.7, 0, Math.PI * 2);
+                ctx.fill();
+            } else {
+                ctx.fillStyle = 'black';
+                ctx.beginPath(); ctx.arc(size - 6, -2, 2, 0, Math.PI * 2); ctx.fill();
+            }
+            ctx.restore();
+
+            // Panic marker floats above, drawn unflipped
+            if (this.alarm > 0) {
+                let my = this.y - lift - size * 2.2;
+                ctx.fillStyle = '#ff2b2b';
+                ctx.fillRect(this.x - 1, my, 3, 7);
+                ctx.fillRect(this.x - 1, my + 9, 3, 3);
+            }
+
+            // Hunger meter -- appears only once a bird is in trouble
+            if (this.hunger > HUNGER_WARN) {
+                let t = (this.hunger - HUNGER_WARN) / (STARVE_FRAMES - HUNGER_WARN);
+                let by = this.y - lift - size * 1.7;
+                ctx.fillStyle = 'rgba(0,0,0,0.45)';
+                ctx.fillRect(this.x - 9, by, 18, 4);
+                ctx.fillStyle = t > 0.66 ? '#ff3b3b' : '#ffa53b';
+                ctx.fillRect(this.x - 8, by + 1, 16 * (1 - t), 2);
+            }
+        }
+    }
+
+    const HORSE_SCALE = 1.35; // a horse should clearly dwarf a chicken
+
+    class Horse {
+        constructor(x, y) {
+            this.x = x; this.y = y;
+            this.facingDir = 1;
+            this.speed = 2.0;
+            this.state = 'wander';
+            this.targetFood = null;
+            this.timer = 0;
+            this.walkCycle = 0;
+            this.peckCycle = 0;
+            this.peckMax = 42; // long enough to see a proper graze + chew
+            this.faceCd = 0;
+            this.galloping = false;
+            this.trot = false;
+            this.plump = 0;   // 0..1 -- rounder and slower, never taller
+            this.poopCd = 60 * (18 + Math.random() * 18);
+            this.fleeTimer = 0;
+            this.fleeX = 0;
+            this.fleeY = 0;
+            this.dustCd = 0;
+        }
+
+        // A round horse is a slow horse
+        get moveSpeed() { return this.speed * (1 - 0.7 * this.plump); }
+
+        update() {
+            let isMoving = false;
+            this.galloping = false;
+            if (this.faceCd > 0) this.faceCd--;
+            if (this.dustCd > 0) this.dustCd--;
+
+            // Horses go too -- and the rounder it gets, the more often and the
+            // more impressive the result
+            if (--this.poopCd <= 0) {
+                this.poopCd = 60 * ((20 + Math.random() * 20) * (1 - 0.55 * this.plump));
+                let px = clampX(this.x - (26 + this.plump * 20) * this.facingDir);
+                let py = clampY(this.y + 3);
+                poops.push(new Poop(px, py, 0.8 + this.plump * 0.7));
+                if (poops.length > POOP_MAX) { let old = poops.shift(); old.active = false; }
+                sndPlop();
+                puff(px, py, 3 + Math.round(this.plump * 4), '#6b5236', 0.8 + this.plump * 0.6);
+            }
+
+            // Flee from cows and bears
+            let bully = nearestBully(this.x, this.y, 170);
+            // A thunderclap keeps it running even with nothing chasing it
+            let spooked = !bully && this.state === 'flee' && this.fleeTimer > 0;
+
+            if (bully || spooked) {
+                // Commit to one escape heading and hold it -- recomputing the
+                // angle every frame is what made it judder on the spot. Re-plan
+                // early if the threat has closed in on our chosen route anyway.
+                if (bully) {
+                    let stale = this.fleeTimer <= 0 ||
+                        dist(this.fleeX, this.fleeY, bully.obj.x, bully.obj.y) < 150;
+                    if (this.state !== 'flee' || stale) {
+                        let esc = pickEscapeTarget(this.x, this.y, bully.obj.x, bully.obj.y, 260);
+                        this.fleeX = esc.x;
+                        this.fleeY = esc.y;
+                        this.fleeTimer = 45 + Math.random() * 30;
+                    }
+                }
+                this.fleeTimer--;
+                this.state = 'flee';
+                this.targetFood = null;
+                this.galloping = true;
+                this.moveTo(this.fleeX, this.fleeY, this.moveSpeed * 1.7);
+                this.walkCycle += 0.34;
+                this.kickDust();
+                return;
+            } else if (this.state === 'flee') {
+                this.state = 'wander';
+                this.fleeTimer = 0;
+            }
+
+            if (this.state === 'peck') {
+                this.peckCycle--;
+                // little flecks of corn kicked up while the muzzle is down
+                if (this.peckCycle < this.peckMax * 0.7 && this.peckCycle % 9 === 0) {
+                    puff(this.x + 44 * this.facingDir, this.y + 8, 2, '#ffcc00', 0.5);
+                }
+                if (this.peckCycle <= 0) {
+                    if (this.targetFood && !this.targetFood.consumed) {
+                        this.targetFood.consumed = true;
+                        // Corn goes straight to the belly -- very gradually
+                        if (this.plump < 1) this.plump = Math.min(1, this.plump + HORSE_PLUMP_PER_KERNEL);
+                        if (Math.random() < 0.4) heart(this.x, this.y - 40);
+                        if (Math.random() < 0.12) sndNeigh();
+                    }
+                    this.state = 'wander'; this.targetFood = null; this.timer = 10;
+                }
+                return;
+            }
+
+            if (this.state === 'wander') {
+                let closest = null; let minDist = Infinity;
+                for (let f of foods) {
+                    if (f.consumed) continue;
+                    let d = dist(this.x, this.y, f.x, f.y);
+                    if (d < 500 && d < minDist) { minDist = d; closest = f; }
+                }
+
+                if (closest) {
+                    this.targetFood = closest; this.state = 'seek';
+                } else {
+                    this.timer--;
+                    if (this.timer <= 0) {
+                        // Every so often, take off across the field for the fun of it
+                        this.trot = Math.random() < 0.35;
+                        let reach = this.trot ? 340 : 150;
+                        this.tX = clampX(this.x + (Math.random() - 0.5) * reach);
+                        this.tY = clampY(this.y + (Math.random() - 0.5) * reach * 0.45);
+                        this.timer = this.trot ? 90 + Math.random() * 60 : 60 + Math.random() * 60;
+                    }
+                    if (this.tX !== undefined) {
+                        isMoving = this.moveTo(this.tX, this.tY, this.trot ? this.moveSpeed * 1.35 : this.moveSpeed * 0.6);
+                        if (isMoving && this.trot) { this.galloping = true; this.kickDust(); }
+                    }
+                }
+            }
+
+            if (this.state === 'seek') {
+                if (!this.targetFood || this.targetFood.consumed) {
+                    this.state = 'wander'; this.targetFood = null;
+                } else {
+                    let d = dist(this.x, this.y, this.targetFood.x, this.targetFood.y);
+                    if (d <= 30) {
+                        this.state = 'peck'; this.peckCycle = this.peckMax;
+                    } else {
+                        isMoving = this.moveTo(this.targetFood.x, this.targetFood.y, this.moveSpeed);
+                    }
+                }
+            }
+            // Past a certain size, galloping is simply off the table
+            if (this.plump > 0.65) this.galloping = false;
+
+            // Sweating and wheezing under its own weight
+            if (this.plump > 0.45 && isMoving) {
+                if (Math.random() < 0.05) {
+                    particles.push(new Particle(this.x + 26 * this.facingDir, this.y - 42, {
+                        vx: (Math.random() - 0.4) * 0.9 * this.facingDir, vy: -0.15,
+                        vz: 1.1, gravity: 0.12, life: 28, color: '#bfe6ff', size: 3
+                    }));
+                }
+                if (this.plump > 0.8 && Math.random() < 0.03) {
+                    puff(this.x, this.y + 2, 2, '#9aa87a', 0.7);
+                }
+            }
+
+            this.walkCycle = isMoving ? this.walkCycle + (this.galloping ? 0.34 : 0.2 - this.plump * 0.09) : 0;
+        }
+
+        // Thunderclap: bolt away from the strike at a full gallop
+        spook(fromX, fromY) {
+            let esc = pickEscapeTarget(this.x, this.y, fromX, fromY, 300);
+            this.fleeX = esc.x;
+            this.fleeY = esc.y;
+            this.fleeTimer = 70 + Math.random() * 40;
+            this.state = 'flee';
+            this.targetFood = null;
+            this.trot = true;
+        }
+
+        // Divots thrown up by the hooves at speed
+        kickDust() {
+            if (this.dustCd > 0) return;
+            this.dustCd = 5;
+            puff(this.x - 18 * this.facingDir, this.y + 4, 2, '#8f9c6a', 0.9);
+        }
+
+        moveTo(tx, ty, speed) {
+            let dx = tx - this.x; let dy = ty - this.y;
+            let d = Math.sqrt(dx * dx + dy * dy);
+            let moved = false;
+            if (d > 1) {
+                this.x += (dx / d) * speed;
+                this.y += (dy / d) * (speed * 0.7);
+                moved = true;
+            }
+            this.face(dx);
+
+            this.x = clampX(this.x);
+            this.y = clampY(this.y);
+            return moved;
+        }
+
+        face(dx) {
+            if (this.faceCd > 0) return;
+            let want = dx > 4 ? 1 : (dx < -4 ? -1 : 0);
+            if (want !== 0 && want !== this.facingDir) {
+                this.facingDir = want;
+                this.faceCd = 15;
+            }
+        }
+
+        draw() {
+            let S = HORSE_SCALE;
+            drawShadow(this.x, this.y, (25 + this.plump * 22) * S, (10 + this.plump * 6) * S);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir * S, S);
+
+            // Walk = four legs out of phase. Gallop = a two-beat bound with the
+            // front pair and back pair swinging together, and the body leaving
+            // the ground between strides.
+            let g = this.galloping;
+            let front = g ? Math.sin(this.walkCycle) * 13 : Math.sin(this.walkCycle + Math.PI) * 8;
+            let back = g ? Math.sin(this.walkCycle + 2.2) * 13 : Math.sin(this.walkCycle) * 8;
+            let ls1 = Math.sin(this.walkCycle) * 8;
+
+            // Grazing: 0 -> 1 -> 0 dip over the peck, with a chewing wiggle
+            let eating = this.state === 'peck';
+            let eatT = eating ? Math.sin((1 - this.peckCycle / this.peckMax) * Math.PI) : 0;
+
+            if (g) {
+                // Bound + a slight forward pitch as it drives off the hind legs
+                ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 9);
+                ctx.rotate(Math.sin(this.walkCycle) * 0.07);
+            }
+
+            let p = this.plump;
+
+            // The fatter it gets the more it rocks side to side
+            if (p > 0.3) ctx.rotate(Math.sin(this.walkCycle) * p * 0.09);
+
+            // Legs -- swallowed up by the belly, ending as little stubs
+            let legLen = 25 - p * 9;
+            ctx.strokeStyle = '#5c4033'; ctx.lineWidth = 4 + p * 2; ctx.beginPath();
+            ctx.moveTo(-15, 5); ctx.lineTo(-15 + back * (1 - p * 0.7), legLen);
+            ctx.moveTo(-5, 5); ctx.lineTo(-5 + back * 0.8 * (1 - p * 0.7), legLen);
+            ctx.moveTo(10, 5); ctx.lineTo(10 + front * 0.8 * (1 - p * 0.7), legLen);
+            ctx.moveTo(20, 5); ctx.lineTo(20 + front * (1 - p * 0.7), legLen);
+            ctx.stroke();
+
+            // Body -- becomes an absolute boulder. Wobbles as it goes.
+            let jig = Math.sin(this.walkCycle * 2) * p * 2.4
+                    + Math.sin(frameCount * 0.05) * p * 1.1; // always breathing
+            ctx.fillStyle = '#8b4513';
+            ctx.beginPath();
+            ctx.ellipse(0, -5 + p * 9, 22 + p * 24 + jig, 12 + p * 15 - jig * 0.4, 0, 0, Math.PI * 2);
+            ctx.fill();
+            if (p > 0.15) {
+                // belly, sagging further the bigger it gets
+                ctx.beginPath();
+                ctx.ellipse(-1, 2 + p * 15, 17 + p * 20 + jig * 0.6, 6 + p * 12, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Once the belly has swallowed the legs, four little hooves twiddle
+            // out from underneath. This is the entire joke.
+            if (p > 0.45) {
+                let by = 2 + p * 15 + (6 + p * 12) * 0.72;
+                ctx.strokeStyle = '#5c4033'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+                ctx.beginPath();
+                [-16, -6, 11, 20].forEach((lx, i) => {
+                    let sw = (i < 2 ? back : front) * (1 - p * 0.75) * 0.6;
+                    ctx.moveTo(lx, by - 5);
+                    ctx.lineTo(lx + sw, by + 5);
+                });
+                ctx.stroke();
+                ctx.lineCap = 'butt';
+            }
+
+            let stream = g ? 10 : 0;
+            let lift = g ? Math.sin(this.walkCycle) * 5 : ls1;
+
+            // Tail, shoved out the back by the sheer mass
+            ctx.save();
+            ctx.translate(-p * 20, p * 4);
+            ctx.fillStyle = 'black';
+            ctx.beginPath();
+            ctx.moveTo(-20, -10);
+            ctx.lineTo(-35 - stream, -5 - lift - stream * 0.5);
+            ctx.lineTo(-20, -2);
+            ctx.fill();
+            ctx.restore();
+
+            // Head stays exactly the same size -- that's the joke. It just ends
+            // up perched on top of the boulder.
+            ctx.save();
+            ctx.translate(p * 18, -p * 5 + jig * 0.3);
+
+            // Grazing: swing the whole head+neck down to the grass from the
+            // base of the neck, and chew.
+            if (eating) {
+                let dip = eatT * 1.0;
+                let chew = Math.sin(this.peckCycle * 0.8) * 0.07 * (eatT > 0.25 ? 1 : 0);
+                ctx.translate(17, 0);
+                ctx.rotate(dip + chew);
+                ctx.translate(-17, 0);
+            }
+
+            // Neck/Head
+            ctx.fillStyle = '#8b4513';
+            ctx.beginPath(); ctx.moveTo(15, -5); ctx.lineTo(35, -20); ctx.lineTo(38, -10); ctx.lineTo(20, 5); ctx.fill();
+
+            // Snout
+            ctx.fillStyle = '#a0522d'; ctx.beginPath(); ctx.ellipse(38, -12, 6, 4, Math.PI / 4, 0, Math.PI * 2); ctx.fill();
+
+            // Mane
+            ctx.fillStyle = 'black';
+            ctx.beginPath();
+            ctx.moveTo(20, -10);
+            ctx.lineTo(32 - stream * 0.4, -22 - stream * 0.3);
+            ctx.lineTo(25, -5);
+            ctx.fill();
+
+            // Eye -- goes strained and wide once it's really struggling
+            if (p > 0.7) {
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath(); ctx.arc(32, -15, 3, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = 'black';
+                ctx.beginPath(); ctx.arc(32.5, -15, 1.6, 0, Math.PI * 2); ctx.fill();
+            } else {
+                ctx.fillStyle = 'black';
+                ctx.beginPath(); ctx.arc(32, -15, 1.5, 0, Math.PI * 2); ctx.fill();
+            }
+            ctx.restore();
+
+            ctx.restore();
+        }
+    }
+
+    class Cow {
+        constructor(x, y) {
+            this.x = x; this.y = y;
+            this.facingDir = 1;
+            this.speed = 0.5;
+            this.state = 'wander';
+            this.timer = 0;
+            this.walkCycle = 0;
+            this.peckCycle = 0;
+            this.eatMax = 100;
+            this.targetGrass = null;
+            this.faceCd = 0;
+            this.poopCd = 60 * (10 + Math.random() * 14);
+            this.meals = 0; // this cow's own grass count, drives its size
+            // Generate fixed spots
+            this.spots = Array(3).fill().map(() => ({ x: (Math.random() - 0.5) * 30, y: (Math.random() - 0.5) * 10, r: 4 + Math.random() * 6 }));
+        }
+
+        update() {
+            let isMoving = false;
+            if (this.faceCd > 0) this.faceCd--;
+
+            // Nature takes its course
+            if (--this.poopCd <= 0) {
+                this.poopCd = 60 * (14 + Math.random() * 16);
+                let px = clampX(this.x - 30 * this.facingDir);
+                let py = clampY(this.y + 3);
+                poops.push(new Poop(px, py));
+                sndPlop();
+                // Retire the oldest properly, so any fly on it knows to leave
+                if (poops.length > POOP_MAX) {
+                    let old = poops.shift();
+                    old.active = false;
+                }
+                puff(px, py, 4, '#6b5236', 0.9);
+            }
+
+            if (this.state === 'eat_grass') {
+                this.peckCycle--;
+                if (this.peckCycle % 20 === 0) {
+                    puff(this.x + 30 * this.facingDir, this.y, 2, '#a8e063', 0.7);
+                }
+                if (this.peckCycle <= 0) {
+                    if (this.targetGrass && !this.targetGrass.eaten) {
+                        this.targetGrass.eaten = true;
+                        cowMeals++;
+                        this.meals++; // I grow a little with every meal
+                        heart(this.x, this.y - 34 * this.girth);
+                        sndMoo();
+                    }
+                    this.targetGrass = null;
+                    this.state = 'wander';
+                    this.timer = 90 + Math.random() * 60;
+                }
+                return;
+            }
+
+            // Drop a target that got eaten or was trimmed back somehow
+            if (this.targetGrass && (this.targetGrass.eaten || !this.targetGrass.ripe)) {
+                this.targetGrass = null;
+            }
+            // Go find the nearest clump worth eating
+            if (!this.targetGrass) {
+                let best = null, bestD = Infinity;
+                for (let g of grasses) {
+                    if (g.eaten || !g.ripe) continue;
+                    let d = dist(this.x, this.y, g.x, g.y);
+                    if (d < bestD) { bestD = d; best = g; }
+                }
+                if (best) this.targetGrass = best;
+            }
+
+            if (this.targetGrass) {
+                this.state = 'seek_grass';
+                if (dist(this.x, this.y, this.targetGrass.x, this.targetGrass.y) <= 30) {
+                    this.state = 'eat_grass';
+                    this.peckCycle = this.eatMax;
+                } else {
+                    // A cow in sight of dinner walks with slightly more purpose
+                    isMoving = this.stepTo(this.targetGrass.x, this.targetGrass.y, 0.8);
+                }
+            } else {
+                this.state = 'wander';
+                this.timer--;
+                if (this.timer <= 0) {
+                    this.tX = clampX(this.x + (Math.random() - 0.5) * 200);
+                    this.tY = clampY(this.y + (Math.random() - 0.5) * 90);
+                    this.timer = 150 + Math.random() * 100;
+                }
+                if (this.tX !== undefined) isMoving = this.stepTo(this.tX, this.tY, this.speed);
+            }
+
+            this.walkCycle = isMoving ? this.walkCycle + 0.1 : 0;
+        }
+
+        // Grows up to ~1.7x its size over its first 20 grass clumps
+        get girth() { return 1 + Math.min(1, this.meals / 20) * 0.7; }
+
+        stepTo(tx, ty, speed) {
+            let dx = tx - this.x; let dy = ty - this.y;
+            let d = Math.sqrt(dx * dx + dy * dy);
+            let moved = false;
+            if (d > 1) {
+                this.x += (dx / d) * speed;
+                this.y += (dy / d) * (speed * 0.7);
+                moved = true;
+            }
+            if (this.faceCd === 0) {
+                let want = dx > 4 ? 1 : (dx < -4 ? -1 : 0);
+                if (want !== 0 && want !== this.facingDir) { this.facingDir = want; this.faceCd = 15; }
+            }
+            this.x = clampX(this.x);
+            this.y = clampY(this.y);
+            return moved;
+        }
+
+        draw() {
+            let g = this.girth;
+            drawShadow(this.x, this.y, 35 * g, 12 * g);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir * g, g);
+
+            let ls1 = Math.sin(this.walkCycle) * 4; let ls2 = Math.sin(this.walkCycle + Math.PI) * 4;
+
+            // Grazing dip for the head only (applied below), 0 -> 1 -> 0
+            let eating = this.state === 'eat_grass';
+            let eatT = eating ? Math.sin((1 - this.peckCycle / this.eatMax) * Math.PI) : 0;
+
+            // Legs
+            ctx.fillStyle = 'black';
+            ctx.fillRect(-22 + ls1, 0, 6, 20); ctx.fillRect(-12 + ls2, 0, 6, 20);
+            ctx.fillRect(10 + ls2, 0, 6, 20); ctx.fillRect(20 + ls1, 0, 6, 20);
+
+            // Body
+            ctx.fillStyle = 'white';
+            ctx.fillRect(-28, -20, 56, 28);
+
+            // Spots
+            ctx.fillStyle = 'black';
+            for (let s of this.spots) { ctx.beginPath(); ctx.arc(s.x, -6 + s.y, s.r, 0, Math.PI * 2); ctx.fill(); }
+
+            // Udder
+            ctx.fillStyle = 'pink';
+            ctx.beginPath(); ctx.arc(0, 8, 6, 0, Math.PI); ctx.fill();
+
+            // Head group -- swings down to the grass from the base of the neck
+            // and chews, instead of the whole cow sinking.
+            ctx.save();
+            if (eating) {
+                let dip = eatT * 0.85;
+                let chew = Math.sin(this.peckCycle * 0.45) * 0.06 * (eatT > 0.2 ? 1 : 0);
+                ctx.translate(25, -6);
+                ctx.rotate(dip + chew);
+                ctx.translate(-25, 6);
+            }
+            // Head
+            ctx.fillStyle = 'white'; ctx.fillRect(25, -25, 20, 24);
+            // Snout -- opens and closes a touch while chewing
+            let jaw = eating ? 2 + Math.abs(Math.sin(this.peckCycle * 0.45)) * 3 : 0;
+            ctx.fillStyle = '#f4b6c2'; ctx.fillRect(38, -10 - jaw * 0.4, 10, 12 + jaw); // muzzle
+            ctx.fillStyle = 'black'; ctx.fillRect(40, -6, 2, 3); ctx.fillRect(44, -6, 2, 3); // nostrils
+            // Eye
+            ctx.fillStyle = 'black'; ctx.fillRect(31, -19, 3, 3);
+            // Horns
+            ctx.fillStyle = '#eeddcc';
+            ctx.beginPath(); ctx.moveTo(28, -25); ctx.lineTo(25, -35); ctx.lineTo(32, -25); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(40, -25); ctx.lineTo(43, -35); ctx.lineTo(36, -25); ctx.fill();
+            ctx.restore();
+
+            ctx.restore();
+        }
+    }
+
+    class Fox {
+        constructor() {
+            // Spawn left or right off-screen
+            this.x = Math.random() > 0.5 ? -50 : canvas.width + 50;
+            this.y = horizonY + 40 + Math.random() * (canvas.height - horizonY - 80);
+            this.speed = 4;
+            this.facingDir = 1;
+            this.walkCycle = 0;
+            this.active = true;
+            this.hasChicken = false;
+            this.scared = false;
+            this.life = 0;
+
+            this.targetChicken = pickPrey(this);
+            this.exitX = this.x < 0 ? canvas.width + 100 : -100; // run to the far side
+        }
+
+        // Zapped: abandon the hunt entirely and sprint for the nearest edge.
+        scare() {
+            if (this.scared) return;
+            this.scared = true;
+            this.targetChicken = null;
+            this.speed = 7;
+            // bolt for whichever side is closer, not all the way across
+            this.exitX = (this.x < canvas.width / 2) ? -100 : canvas.width + 100;
+            puff(this.x, this.y, 8, '#d9d0b0', 2.0);
+        }
+
+        update() {
+            this.life++;
+            // Give up after ~18s so a fox never loiters forever
+            if (this.life > 60 * 18) this.hasChicken = true;
+
+            if (!this.scared && !this.hasChicken &&
+                (!this.targetChicken || this.targetChicken.dead || this.targetChicken.state === 'toCoop')) {
+                this.targetChicken = pickPrey(this);
+            }
+
+            let tx, ty;
+            if (!this.scared && !this.hasChicken && this.targetChicken) {
+                tx = this.targetChicken.x;
+                ty = this.targetChicken.y;
+                if (dist(this.x, this.y, tx, ty) < 18) {
+                    this.targetChicken.dead = true;
+                    featherBurst(this.targetChicken.x, this.targetChicken.y);
+                    this.hasChicken = true;
+                    chickensLost++;
+                    sndYip();
+                }
+            } else {
+                tx = this.exitX;
+                ty = this.y;
+            }
+
+            let dx = tx - this.x; let dy = ty - this.y;
+            let d = Math.sqrt(dx * dx + dy * dy);
+            if (d > 1) {
+                this.x += (dx / d) * this.speed;
+                this.y += (dy / d) * (this.speed * 0.7);
+            }
+            if (Math.abs(dx) > 0.5) this.facingDir = dx > 0 ? 1 : -1;
+
+            // Off the edge of the yard? Then it's gone.
+            if ((this.scared || this.hasChicken || !this.targetChicken) &&
+                (this.x < -80 || this.x > canvas.width + 80)) {
+                this.active = false;
+            }
+
+            this.walkCycle += 0.4;
+        }
+
+        draw() {
+            drawShadow(this.x, this.y, 20, 8);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir, 1);
+
+            // Bounding run
+            ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 6);
+
+            // Legs
+            ctx.strokeStyle = '#222'; ctx.lineWidth = 3; ctx.beginPath();
+            let ls1 = Math.sin(this.walkCycle) * 10; let ls2 = Math.sin(this.walkCycle + Math.PI) * 10;
+            ctx.moveTo(-10, 5); ctx.lineTo(-10 + ls1, 15);
+            ctx.moveTo(10, 5); ctx.lineTo(10 + ls2, 15);
+            ctx.stroke();
+
+            // Tail
+            ctx.fillStyle = '#ff7700';
+            ctx.beginPath(); ctx.ellipse(-20, -5, 12, 5, Math.PI / 6 + Math.sin(this.walkCycle) * 0.2, 0, Math.PI * 2); ctx.fill();
+            // Tail tip
+            ctx.fillStyle = 'white';
+            ctx.beginPath(); ctx.arc(-30, -10, 4, 0, Math.PI * 2); ctx.fill();
+
+            // Body
+            ctx.fillStyle = '#d95a00';
+            ctx.beginPath(); ctx.ellipse(0, 0, 18, 8, 0, 0, Math.PI * 2); ctx.fill();
+
+            // Head/Snout
+            ctx.beginPath(); ctx.moveTo(10, -5); ctx.lineTo(25, 2); ctx.lineTo(10, 5); ctx.fill();
+
+            // Ears
+            ctx.fillStyle = '#222';
+            ctx.beginPath(); ctx.moveTo(8, -5); ctx.lineTo(5, -12); ctx.lineTo(12, -2); ctx.fill();
+
+            // Eye
+            ctx.fillStyle = '#ffe08a';
+            ctx.fillRect(12, -4, 3, 2);
+
+            if (this.hasChicken) {
+                // A very limp chicken in the mouth
+                ctx.fillStyle = 'white';
+                ctx.beginPath(); ctx.arc(22, 5, 6, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = '#cc0000'; ctx.fillRect(20, 2, 3, 3);
+                ctx.strokeStyle = '#ffa500'; ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.moveTo(24, 9); ctx.lineTo(28, 14); ctx.stroke();
+            }
+
+            ctx.restore();
+        }
+    }
+
+    class GrassPatch {
+        constructor(x, y) {
+            this.x = x; this.y = y;
+            this.growth = 0;
+            this.eaten = false;
+            this.blades = [];
+            let n = 4 + Math.floor(Math.random() * 3);
+            for (let i = 0; i < n; i++) {
+                this.blades.push({
+                    dx: (Math.random() - 0.5) * 15,
+                    h: 9 + Math.random() * 9,
+                    lean: (Math.random() - 0.5) * 7
+                });
+            }
+        }
+        get ripe() { return this.growth >= GRASS_RIPE; }
+        update() {
+            if (this.growth < 1) this.growth = Math.min(1, this.growth + GRASS_RATE);
+        }
+        draw() {
+            let g = this.growth;
+            // Pale patch of fresh growth on the darker field
+            ctx.fillStyle = 'rgba(168, 224, 99,' + (0.2 + 0.35 * g) + ')';
+            ctx.beginPath();
+            ctx.ellipse(this.x, this.y, 4 + 12 * g, 2 + 5 * g, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            let sway = Math.sin(frameCount * 0.04 + this.x * 0.05) * 2 * g;
+            ctx.strokeStyle = this.ripe ? '#b6ee6a' : '#8fc76a';
+            ctx.lineWidth = 2;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            for (let b of this.blades) {
+                ctx.moveTo(this.x + b.dx, this.y);
+                ctx.lineTo(this.x + b.dx + b.lean * g + sway, this.y - b.h * g);
+            }
+            ctx.stroke();
+            ctx.lineCap = 'butt';
+        }
+    }
+
+    // Only one clump per small area: reject any spot too near an existing one.
+    function trySpawnGrass() {
+        if (grasses.length >= GRASS_MAX) return false;
+        for (let attempt = 0; attempt < 25; attempt++) {
+            let x = playArea.minX + Math.random() * (playArea.maxX - playArea.minX);
+            let y = playArea.minY + Math.random() * (playArea.maxY - playArea.minY);
+            let clear = true;
+            for (let g of grasses) {
+                if (dist(x, y, g.x, g.y) < GRASS_SPACING) { clear = false; break; }
+            }
+            if (clear) { grasses.push(new GrassPatch(x, y)); return true; }
+        }
+        return false;
+    }
+
+    class Poop {
+        constructor(x, y, scale = 1) {
+            this.x = x; this.y = y;
+            this.age = 0;
+            this.blobs = [];
+            let n = 2 + Math.floor(Math.random() * 2);
+            for (let i = 0; i < n; i++) {
+                this.blobs.push({
+                    dx: (Math.random() - 0.5) * 9 * scale,
+                    dy: (Math.random() - 0.5) * 4 * scale,
+                    r: (4 + Math.random() * 3.5) * scale
+                });
+            }
+            this.food = 1;   // eaten down by flies
+            this.active = true;
+        }
+        update() {
+            this.age++;
+            if (this.food <= 0) this.active = false;
+        }
+        draw() {
+            // dries out and pales with age, and shrinks as the flies work on it
+            let dry = Math.min(1, this.age / (60 * 25));
+            let shrink = 0.35 + 0.65 * Math.max(0, this.food);
+            ctx.fillStyle = dry > 0.5 ? '#6b5236' : '#4a3520';
+            for (let b of this.blobs) {
+                ctx.beginPath();
+                ctx.ellipse(this.x + b.dx * shrink, this.y + b.dy * shrink,
+                            b.r * shrink, b.r * 0.55 * shrink, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            // a little shine while it's fresh
+            if (dry < 0.4) {
+                ctx.fillStyle = 'rgba(255,255,255,0.18)';
+                ctx.beginPath();
+                ctx.ellipse(this.x - 2, this.y - 2, 2.5 * shrink, 1.2 * shrink, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+    }
+
+    class Fly {
+        constructor(target) {
+            this.target = target;
+            this.x = Math.random() > 0.5 ? -20 : canvas.width + 20;
+            this.y = clampY(target.y + (Math.random() - 0.5) * 120);
+            this.z = 30 + Math.random() * 50;
+            this.state = 'incoming';
+            this.phase = Math.random() * Math.PI * 2;
+            this.freq = 0.18 + Math.random() * 0.14;
+            this.orbit = Math.random() * Math.PI * 2;
+            this.orbitR = 5 + Math.random() * 9;
+            this.spook = 0;
+            this.wing = 0;
+            this.active = true;
+        }
+
+        update() {
+            this.phase += this.freq;
+            this.wing += 1.1;
+
+            // Dinner gone (or cleaned up)? Off we go.
+            if (this.state !== 'leaving' && (!this.target || !this.target.active)) {
+                this.state = 'leaving';
+            }
+
+            if (this.state === 'feeding') {
+                // something big lumbering past sends them up in a cloud
+                for (let o of cows) if (dist(this.x, this.y, o.x, o.y) < 75) this.spook = 45;
+                for (let o of horses) if (dist(this.x, this.y, o.x, o.y) < 70) this.spook = 45;
+                for (let o of bears) if (dist(this.x, this.y, o.x, o.y) < 80) this.spook = 45;
+            }
+            if (this.spook > 0) this.spook--;
+
+            if (this.state === 'incoming') {
+                let dx = this.target.x - this.x, dy = this.target.y - this.y;
+                let d = Math.sqrt(dx * dx + dy * dy);
+                if (d > 1) {
+                    this.x += (dx / d) * 2.6 + Math.sin(this.phase * 1.7) * 1.2;
+                    this.y += (dy / d) * 1.6 + Math.cos(this.phase * 1.3) * 0.7;
+                }
+                this.z += (4 - this.z) * 0.05;
+                if (d < 16 && this.z < 10) this.state = 'feeding';
+
+            } else if (this.state === 'feeding') {
+                this.orbit += 0.22;
+                let r = this.orbitR + (this.spook > 0 ? 24 : 0);
+                this.x = this.target.x + Math.cos(this.orbit) * r + Math.sin(this.phase * 2.1) * 1.5;
+                this.y = this.target.y + Math.sin(this.orbit) * r * 0.5;
+                this.z = (this.spook > 0 ? 18 : 2.5) + Math.abs(Math.sin(this.phase)) * 3;
+                // only actually eating when settled
+                if (this.spook === 0) this.target.food -= FLY_EAT;
+
+            } else {
+                this.z += 1.2;
+                this.x += (this.x < canvas.width / 2 ? -2.8 : 2.8) + Math.sin(this.phase);
+                this.y += Math.cos(this.phase * 0.8) * 0.5;
+                if (this.x < -40 || this.x > canvas.width + 40 || this.z > 220) this.active = false;
+            }
+        }
+
+        draw() {
+            if (this.z < 14) drawShadow(this.x, this.y, 2, 1);
+            ctx.save();
+            ctx.translate(this.x, this.y - this.z);
+            // wing blur
+            ctx.fillStyle = 'rgba(225,235,245,0.55)';
+            let w = 3 + Math.abs(Math.sin(this.wing)) * 2.5;
+            ctx.beginPath(); ctx.ellipse(0, -1.5, w, 1.8, 0, 0, Math.PI * 2); ctx.fill();
+            // body
+            ctx.fillStyle = '#141414';
+            ctx.fillRect(-2, -1.5, 4, 3);
+            ctx.restore();
+        }
+    }
+
+    // Rabbits go for whatever clump is closest and far enough along to bother with
+    function pickGrassForRabbit(x, y) {
+        let best = null, bestD = Infinity;
+        for (let g of grasses) {
+            if (g.eaten || g.growth < 0.25) continue;
+            if (g.claimedByRabbit) continue;
+            let d = dist(x, y, g.x, g.y);
+            if (d < bestD) { bestD = d; best = g; }
+        }
+        return best;
+    }
+
+    class Rabbit {
+        constructor() {
+            this.dir = Math.random() > 0.5 ? 1 : -1;
+            this.x = this.dir === 1 ? -50 : canvas.width + 50;
+            this.y = playArea.minY + 20 + Math.random() * (playArea.maxY - playArea.minY - 20);
+            // Aim well past the despawn boundary -- heading for exactly the
+            // spawn point left them parked just short of it, forever.
+            this.exitX = this.dir === 1 ? -150 : canvas.width + 150;
+            this.speed = 2.5;
+            this.facingDir = this.dir;
+            this.z = 0;
+            this.hop = 0;
+            this.state = 'seek';
+            this.nibble = 0;
+            this.nibbleTime = 55;
+            this.swarm = false;
+            this.carrying = false;
+            this.faceCd = 0;
+            this.active = true;
+            this.target = null;
+        }
+
+        bail() {
+            if (this.target) { this.target.claimedByRabbit = false; this.target = null; }
+            this.state = 'leave';
+        }
+
+        update() {
+            if (this.faceCd > 0) this.faceCd--;
+
+            // Skittish -- unless it's in a swarm, where numbers make them bold
+            if (this.state !== 'leave' && !this.swarm) {
+                let spooked = nearestBully(this.x, this.y, 120);
+                if (!spooked) {
+                    for (let f of foxes) {
+                        if (dist(this.x, this.y, f.x, f.y) < 150) { spooked = true; break; }
+                    }
+                }
+                if (spooked) { this.bail(); puff(this.x, this.y, 4, '#e0d6c8', 1.2); }
+            }
+
+            if (this.state === 'nibble') {
+                this.nibble--;
+                if (this.nibble % 12 === 0) puff(this.x + 8 * this.facingDir, this.y, 2, '#a8e063', 0.6);
+                if (this.nibble <= 0) {
+                    if (this.target && !this.target.eaten) {
+                        this.target.eaten = true;
+                        this.target.claimedByRabbit = false;
+                        grassStolen++;
+                        this.carrying = true;
+                    }
+                    this.target = null;
+                    this.state = 'leave';
+                }
+                return;
+            }
+
+            if (this.state === 'seek') {
+                if (!this.target || this.target.eaten) {
+                    if (this.target) this.target.claimedByRabbit = false;
+                    this.target = pickGrassForRabbit(this.x, this.y);
+                    if (this.target) this.target.claimedByRabbit = true;
+                }
+                if (!this.target) {
+                    this.state = 'leave';
+                } else if (dist(this.x, this.y, this.target.x, this.target.y) < 18) {
+                    this.state = 'nibble';
+                    this.nibble = this.nibbleTime;
+                } else {
+                    this.hopTo(this.target.x, this.target.y);
+                }
+            }
+
+            if (this.state === 'leave') {
+                this.hopTo(this.exitX, this.y);
+                if (this.x < -70 || this.x > canvas.width + 70) this.active = false;
+            }
+        }
+
+        hopTo(tx, ty) {
+            let wasDown = this.z < 1;
+            this.hop += 0.26;
+            this.z = Math.abs(Math.sin(this.hop)) * 10;
+            if (wasDown && this.z >= 1) sndHop();
+            // most of the ground is covered at the top of the bound
+            let sp = this.speed * (0.35 + Math.abs(Math.sin(this.hop)));
+            let dx = tx - this.x, dy = ty - this.y;
+            let d = Math.sqrt(dx * dx + dy * dy);
+            if (d > 1) {
+                this.x += (dx / d) * sp;
+                this.y += (dy / d) * (sp * 0.7);
+            }
+            if (this.faceCd === 0) {
+                let want = dx > 4 ? 1 : (dx < -4 ? -1 : 0);
+                if (want !== 0 && want !== this.facingDir) { this.facingDir = want; this.faceCd = 12; }
+            }
+            this.y = clampY(this.y);
+        }
+
+        draw() {
+            let sScale = 1 / (1 + this.z * 0.03);
+            drawShadow(this.x, this.y, 11 * sScale, 4.5 * sScale);
+
+            ctx.save();
+            ctx.translate(this.x, this.y - this.z);
+            ctx.scale(this.facingDir, 1);
+
+            let tuck = this.z * 0.12; // legs tuck up mid-hop
+
+            // Hind legs
+            ctx.fillStyle = '#a89684';
+            ctx.beginPath(); ctx.ellipse(-6, 1 - tuck, 6, 4, 0, 0, Math.PI * 2); ctx.fill();
+            // Front legs
+            ctx.strokeStyle = '#a89684'; ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            ctx.moveTo(6, -1); ctx.lineTo(7, 4 - tuck);
+            ctx.stroke();
+
+            // Body
+            ctx.fillStyle = '#bdab99';
+            ctx.beginPath(); ctx.ellipse(0, -4, 12, 7.5, -0.15, 0, Math.PI * 2); ctx.fill();
+
+            // Cotton tail
+            ctx.fillStyle = '#fdfaf5';
+            ctx.beginPath(); ctx.arc(-11, -5, 3.5, 0, Math.PI * 2); ctx.fill();
+
+            // Head
+            ctx.fillStyle = '#bdab99';
+            ctx.beginPath(); ctx.ellipse(9, -9, 6, 5, 0, 0, Math.PI * 2); ctx.fill();
+
+            // Ears -- laid back when running away
+            let lay = this.state === 'leave' ? 0.9 : 0.15;
+            ctx.save();
+            ctx.translate(8, -12);
+            for (let i = 0; i < 2; i++) {
+                ctx.save();
+                ctx.rotate(-0.25 + lay + i * 0.28);
+                ctx.fillStyle = '#bdab99';
+                ctx.beginPath(); ctx.ellipse(0, -6, 2.6, 7, 0, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = '#e6b8b8';
+                ctx.beginPath(); ctx.ellipse(0, -6, 1.2, 4.5, 0, 0, Math.PI * 2); ctx.fill();
+                ctx.restore();
+            }
+            ctx.restore();
+
+            // Eye + nose
+            ctx.fillStyle = '#1a1a1a';
+            ctx.beginPath(); ctx.arc(11, -10, 1.4, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#d98a8a';
+            ctx.beginPath(); ctx.arc(14.5, -8, 1.2, 0, Math.PI * 2); ctx.fill();
+
+            // Swag
+            if (this.carrying) {
+                ctx.strokeStyle = '#b6ee6a'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+                ctx.beginPath();
+                ctx.moveTo(14, -7); ctx.lineTo(21, -11);
+                ctx.moveTo(16, -7); ctx.lineTo(22, -5);
+                ctx.stroke();
+                ctx.lineCap = 'butt';
+            }
+
+            ctx.restore();
+        }
+    }
+
+    // The field got overgrown -- every rabbit in the county turns up at once,
+    // one per clump, and strips the lot.
+    function triggerRabbitSwarm() {
+        let targets = grasses.filter(g => !g.eaten);
+        if (targets.length === 0) return;
+        showBanner('RABBIT SWARM!', '#f0e2cc',
+            'Rabbits! They are eating all of the grass!');
+        for (let g of targets) {
+            let r = new Rabbit();
+            r.swarm = true;
+            r.speed = 3.8;
+            r.nibbleTime = 22;
+            r.y = clampY(g.y + (Math.random() - 0.5) * 90);
+            r.target = g;
+            g.claimedByRabbit = true;
+            rabbits.push(r);
+        }
+    }
+
+    // ============================================================
+    //  HAZARDS
+    //  Each one makes a patch of the yard unsafe. Hens naturally shy
+    //  away from them -- but greed beats fear, so if you drop corn in
+    //  a danger zone they will walk right into it. Placement is the game.
+    // ============================================================
+
+    function eatChicken(c, byWhat) {
+        if (!c || c.dead) return false;
+        c.dead = true;
+        chickensLost++;
+        featherBurst(c.x, c.y);
+        puff(c.x, c.y, 6, '#d8d8d8', 1.2);
+        sndYip();
+        return true;
+    }
+
+    class Wolf {
+        constructor() {
+            this.dir = Math.random() > 0.5 ? 1 : -1;
+            this.x = this.dir === 1 ? -70 : canvas.width + 70;
+            this.y = playArea.minY + 40 + Math.random() * (playArea.maxY - playArea.minY - 60);
+            this.homeX = playArea.minX + 150 + Math.random() * (playArea.maxX - playArea.minX - 300);
+            this.facingDir = this.dir;
+            this.speed = 2.4;
+            this.state = 'arrive';
+            this.lurk = 60 * (11 + Math.random() * 6); // hangs about this long
+            this.walkCycle = 0;
+            this.blink = 0;
+            this.active = true;
+            this.killR = 52; this.scareR = 98;
+        }
+        update() {
+            this.walkCycle += 0.18;
+            if (this.state === 'arrive') {
+                let dx = this.homeX - this.x;
+                if (Math.abs(dx) < 4) { this.state = 'lurk'; }
+                else { this.x += Math.sign(dx) * this.speed; this.facingDir = Math.sign(dx); }
+            } else if (this.state === 'lurk') {
+                // shifts about a little, looking for a meal
+                this.x += Math.sin(frameCount * 0.01) * 0.3;
+                if (--this.lurk <= 0) { this.state = 'leave'; }
+                if (Math.random() < 0.01) this.facingDir *= -1;
+            } else {
+                this.x += this.dir * this.speed;
+                if (this.x < -110 || this.x > canvas.width + 110) this.active = false;
+            }
+            // Only snaps once it has settled -- so the flock gets a moment to
+            // scatter as it walks in, and deaths come from bad corn placement
+            // rather than bad luck.
+            if (this.state === 'lurk') {
+                for (let c of chickens) {
+                    if (c.dead || c.state === 'exodus' || c.state === 'toCoop') continue;
+                    if (dist(this.x, this.y, c.x, c.y) < this.killR) {
+                        if (eatChicken(c, 'wolf')) { this.chomp = 12; }
+                    }
+                }
+            }
+            if (this.chomp > 0) this.chomp--;
+        }
+        draw() {
+            drawShadow(this.x, this.y, 30, 11);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir, 1);
+            let bob = this.state === 'lurk' ? Math.sin(frameCount * 0.05) * 1.2 : -Math.abs(Math.sin(this.walkCycle)) * 3;
+            ctx.translate(0, bob);
+            let sw = this.state === 'lurk' ? Math.sin(frameCount * 0.06) * 2 : Math.sin(this.walkCycle) * 8;
+            // legs
+            ctx.strokeStyle = '#3b3f45'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(-14, 2); ctx.lineTo(-14 + sw, 20);
+            ctx.moveTo(-5, 2); ctx.lineTo(-5 - sw * 0.6, 20);
+            ctx.moveTo(9, 2); ctx.lineTo(9 - sw * 0.6, 20);
+            ctx.moveTo(18, 2); ctx.lineTo(18 + sw, 20);
+            ctx.stroke(); ctx.lineCap = 'butt';
+            // bushy tail
+            ctx.fillStyle = '#4a5058';
+            ctx.beginPath(); ctx.ellipse(-24, -6, 13, 6, -0.4 + Math.sin(frameCount * 0.05) * 0.15, 0, Math.PI * 2); ctx.fill();
+            // body
+            ctx.fillStyle = '#5a616b';
+            ctx.beginPath(); ctx.ellipse(0, -6, 22, 11, 0, 0, Math.PI * 2); ctx.fill();
+            // shaggy ruff
+            ctx.fillStyle = '#4a5058';
+            ctx.beginPath(); ctx.ellipse(9, -8, 11, 10, 0, 0, Math.PI * 2); ctx.fill();
+            // head
+            ctx.fillStyle = '#5a616b';
+            ctx.beginPath(); ctx.ellipse(21, -13, 11, 8, 0, 0, Math.PI * 2); ctx.fill();
+            // snout
+            ctx.beginPath(); ctx.moveTo(27, -14); ctx.lineTo(40, -10); ctx.lineTo(27, -6); ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#20242a';
+            ctx.beginPath(); ctx.arc(39, -10, 2.4, 0, Math.PI * 2); ctx.fill();
+            // teeth when it snaps
+            if (this.chomp > 0) {
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath(); ctx.moveTo(30, -10); ctx.lineTo(34, -5); ctx.lineTo(36, -10); ctx.closePath(); ctx.fill();
+            }
+            // ears
+            ctx.fillStyle = '#4a5058';
+            ctx.beginPath(); ctx.moveTo(16, -19); ctx.lineTo(19, -29); ctx.lineTo(23, -18); ctx.closePath(); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(24, -19); ctx.lineTo(28, -28); ctx.lineTo(30, -17); ctx.closePath(); ctx.fill();
+            // EVIL RED EYES -- glowing, with a menacing flicker
+            let glow = 0.65 + Math.sin(frameCount * 0.12) * 0.35;
+            ctx.globalAlpha = glow;
+            ctx.fillStyle = '#ff2b2b';
+            ctx.beginPath(); ctx.arc(24, -15, 4.2, 0, Math.PI * 2); ctx.fill();
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = '#ff0000';
+            ctx.beginPath(); ctx.arc(24, -15, 2.3, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#ffd0d0';
+            ctx.fillRect(23.3, -16.2, 1.4, 1.4);
+            ctx.restore();
+        }
+    }
+
+    class Gator {
+        constructor() {
+            this.side = Math.random() > 0.5 ? 1 : -1; // -1 = left edge, 1 = right
+            this.y = playArea.minY + 50 + Math.random() * (playArea.maxY - playArea.minY - 80);
+            // resting spot is just INSIDE the field, so it's visible once out
+            this.x = this.side === -1 ? playArea.minX + 48 : playArea.maxX - 48;
+            this.facingDir = this.side === -1 ? 1 : -1; // faces into the field
+            this.emerge = 0;                 // 0..1 slides out of the edge
+            this.life = 60 * (13 + Math.random() * 7);
+            this.snap = 0;
+            this.active = true;
+            this.killR = 60; this.scareR = 98;
+        }
+        update() {
+            if (this.life > 60 * 3) this.emerge = Math.min(1, this.emerge + 0.02);
+            else this.emerge = Math.max(0, this.emerge - 0.02);
+            if (--this.life <= 0 && this.emerge <= 0) this.active = false;
+            if (this.snap > 0) this.snap--;
+            if (this.emerge > 0.6) {
+                for (let c of chickens) {
+                    if (c.dead || c.state === 'exodus' || c.state === 'toCoop') continue;
+                    if (dist(this.x, this.y, c.x, c.y) < this.killR) {
+                        if (eatChicken(c, 'gator')) this.snap = 16;
+                    }
+                }
+            }
+        }
+        draw() {
+            let e = this.emerge;
+            if (e <= 0.02) return;
+            let px = this.x + (this.side === -1 ? -1 : 1) * (1 - e) * 95;
+            drawShadow(px, this.y, 40 * e, 10 * e);
+            ctx.save();
+            ctx.translate(px, this.y);
+            ctx.scale(this.facingDir, 1);
+            let jaw = this.snap > 0 ? 9 : 2 + Math.sin(frameCount * 0.04) * 1.2;
+            // tail
+            ctx.fillStyle = '#3f6b3a';
+            ctx.beginPath(); ctx.moveTo(-30, -6); ctx.lineTo(-62, 2); ctx.lineTo(-30, 4); ctx.closePath(); ctx.fill();
+            // body
+            ctx.fillStyle = '#4c7d44';
+            ctx.beginPath(); ctx.ellipse(-6, -4, 30, 10, 0, 0, Math.PI * 2); ctx.fill();
+            // scaly ridges
+            ctx.fillStyle = '#3f6b3a';
+            for (let i = -3; i < 4; i++) {
+                ctx.beginPath(); ctx.moveTo(i * 8 - 4, -12); ctx.lineTo(i * 8, -18); ctx.lineTo(i * 8 + 4, -12); ctx.closePath(); ctx.fill();
+            }
+            // legs
+            ctx.fillStyle = '#3f6b3a';
+            ctx.fillRect(-16, 2, 7, 9); ctx.fillRect(8, 2, 7, 9);
+            // upper jaw
+            ctx.fillStyle = '#4c7d44';
+            ctx.beginPath(); ctx.moveTo(20, -10); ctx.lineTo(62, -6 - jaw * 0.3); ctx.lineTo(62, -1 - jaw * 0.3); ctx.lineTo(20, -1); ctx.closePath(); ctx.fill();
+            // lower jaw (opens)
+            ctx.fillStyle = '#43703c';
+            ctx.beginPath(); ctx.moveTo(20, 0); ctx.lineTo(60, 1 + jaw); ctx.lineTo(60, 5 + jaw); ctx.lineTo(20, 4); ctx.closePath(); ctx.fill();
+            // teeth
+            ctx.fillStyle = '#ffffff';
+            for (let i = 0; i < 5; i++) {
+                let tx = 28 + i * 7;
+                ctx.beginPath(); ctx.moveTo(tx, -1); ctx.lineTo(tx + 3, 3); ctx.lineTo(tx + 5, -1); ctx.closePath(); ctx.fill();
+            }
+            // eye ridge + eye
+            ctx.fillStyle = '#4c7d44';
+            ctx.beginPath(); ctx.arc(22, -14, 6, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#e8d24a';
+            ctx.beginPath(); ctx.arc(23, -14, 3.4, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#000';
+            ctx.fillRect(22.4, -16.4, 1.6, 4.8);
+            ctx.restore();
+        }
+    }
+
+    class Farmer {
+        constructor() {
+            this.dir = Math.random() > 0.5 ? 1 : -1;
+            this.x = this.dir === 1 ? -50 : canvas.width + 50;
+            this.y = playArea.minY + 60 + Math.random() * (playArea.maxY - playArea.minY - 90);
+            this.stopX = this.dir === 1
+                ? playArea.minX + 120 + Math.random() * 200
+                : playArea.maxX - 120 - Math.random() * 200;
+            this.facingDir = this.dir;
+            this.speed = 2.0;
+            this.state = 'arrive';
+            this.rant = 60 * (5 + Math.random() * 3);
+            this.walkCycle = 0;
+            this.active = true;
+            this.scareR = 125;   // he only shoos -- no chicken dinner for him
+        }
+        update() {
+            this.walkCycle += 0.22;
+            if (this.state === 'arrive') {
+                let dx = this.stopX - this.x;
+                if (Math.abs(dx) < 5) this.state = 'rant';
+                else { this.x += Math.sign(dx) * this.speed; this.facingDir = Math.sign(dx); }
+            } else if (this.state === 'rant') {
+                if (--this.rant <= 0) { this.state = 'leave'; this.facingDir = -this.dir; }
+            } else {
+                this.x -= this.dir * this.speed;
+                if (this.x < -90 || this.x > canvas.width + 90) this.active = false;
+            }
+        }
+        draw() {
+            drawShadow(this.x, this.y, 16, 6);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir, 1);
+            let ranting = this.state === 'rant';
+            let step = this.state === 'rant' ? 0 : Math.sin(this.walkCycle) * 6;
+            let wave = ranting ? Math.sin(frameCount * 0.35) * 22 : 0;
+            let hop = ranting ? Math.abs(Math.sin(frameCount * 0.18)) * 3 : 0;
+            ctx.translate(0, -hop);
+            // legs (denim)
+            ctx.strokeStyle = '#3a5a8c'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(-3, -18); ctx.lineTo(-3 + step, 2);
+            ctx.moveTo(3, -18); ctx.lineTo(3 - step, 2);
+            ctx.stroke();
+            // boots
+            ctx.fillStyle = '#4a3520';
+            ctx.fillRect(-7 + step, 0, 9, 4); ctx.fillRect(-1 - step, 0, 9, 4);
+            // body / overalls
+            ctx.fillStyle = '#4f7fbf';
+            ctx.fillRect(-9, -42, 18, 26);
+            // shirt sleeves
+            ctx.fillStyle = '#c9524a';
+            ctx.fillRect(-11, -42, 22, 9);
+            // arms -- one shaking a fist
+            ctx.strokeStyle = '#e8b98c'; ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(-9, -38); ctx.lineTo(-16, -30 + step * 0.4);
+            ctx.moveTo(9, -38); ctx.lineTo(17, -44 - wave);
+            ctx.stroke();
+            ctx.lineCap = 'butt';
+            // fist
+            ctx.fillStyle = '#e8b98c';
+            ctx.beginPath(); ctx.arc(17, -45 - wave, 4, 0, Math.PI * 2); ctx.fill();
+            // head
+            ctx.fillStyle = '#f0c49a';
+            ctx.beginPath(); ctx.arc(0, -50, 8.5, 0, Math.PI * 2); ctx.fill();
+            // angry red face when ranting
+            if (ranting) {
+                ctx.fillStyle = 'rgba(220,60,50,0.45)';
+                ctx.beginPath(); ctx.arc(0, -50, 8.5, 0, Math.PI * 2); ctx.fill();
+            }
+            // angry brows + eyes + shouting mouth
+            ctx.strokeStyle = '#3a2a1a'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(-6, -54); ctx.lineTo(-1, -52); ctx.moveTo(6, -54); ctx.lineTo(1, -52); ctx.stroke();
+            ctx.fillStyle = '#000';
+            ctx.beginPath(); ctx.arc(-3, -50, 1.4, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(3, -50, 1.4, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#6b2020';
+            if (ranting) { ctx.beginPath(); ctx.ellipse(0, -45, 3.5, 2.5 + Math.abs(Math.sin(frameCount * 0.3)) * 1.5, 0, 0, Math.PI * 2); ctx.fill(); }
+            else ctx.fillRect(-3, -46, 6, 1.6);
+            // straw hat
+            ctx.fillStyle = '#d9b451';
+            ctx.beginPath(); ctx.ellipse(0, -57, 15, 4, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(0, -61, 7.5, 6, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.restore();
+            // shouting marks
+            if (ranting && Math.floor(frameCount / 12) % 2 === 0) {
+                ctx.fillStyle = '#fff2a8';
+                ctx.font = 'bold 16px "Courier New", monospace';
+                ctx.fillText('!', this.x + 22 * this.facingDir, this.y - 62);
+            }
+        }
+    }
+
+    class Puddle {
+        constructor(x, y) {
+            this.x = x; this.y = y;
+            this.grow = 0;
+            this.life = 60 * (38 + Math.random() * 22);
+            this.active = true;
+            this.stickR = 36;
+            this.blobs = [];
+            for (let i = 0; i < 4; i++) {
+                this.blobs.push({ dx: (Math.random() - 0.5) * 34, dy: (Math.random() - 0.5) * 14,
+                    rx: 14 + Math.random() * 14, ry: 6 + Math.random() * 6 });
+            }
+        }
+        update() {
+            this.grow = Math.min(1, this.grow + 0.02);
+            if (--this.life <= 0) { this.grow -= 0.02; if (this.grow <= 0) this.active = false; }
+        }
+        draw() {
+            let g = Math.max(0, this.grow);
+            ctx.save();
+            ctx.globalAlpha = 0.85 * g;
+            ctx.fillStyle = '#5b4a33';
+            for (let b of this.blobs) {
+                ctx.beginPath(); ctx.ellipse(this.x + b.dx * g, this.y + b.dy * g, b.rx * g, b.ry * g, 0, 0, Math.PI * 2); ctx.fill();
+            }
+            // wet shine
+            ctx.globalAlpha = 0.30 * g;
+            ctx.fillStyle = '#9fc0d8';
+            for (let b of this.blobs) {
+                ctx.beginPath(); ctx.ellipse(this.x + b.dx * g - 2, this.y + b.dy * g - 2, b.rx * 0.55 * g, b.ry * 0.45 * g, 0, 0, Math.PI * 2); ctx.fill();
+            }
+            ctx.restore();
+        }
+    }
+
+    class ThornBush {
+        constructor(x, y) {
+            this.x = x; this.y = y;
+            this.grow = 0;
+            this.life = 60 * (45 + Math.random() * 30);
+            this.active = true;
+            this.stickR = 30;
+            this.arms = [];
+            for (let i = 0; i < 9; i++) {
+                let a = (i / 9) * Math.PI * 2 + Math.random() * 0.4;
+                this.arms.push({ a: a, len: 12 + Math.random() * 12 });
+            }
+        }
+        update() {
+            this.grow = Math.min(1, this.grow + 0.012);
+            if (--this.life <= 0) { this.grow -= 0.015; if (this.grow <= 0) this.active = false; }
+        }
+        draw() {
+            let g = Math.max(0, this.grow);
+            if (g <= 0.02) return;
+            drawShadow(this.x, this.y, 22 * g, 8 * g);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            // dark tangled mass
+            ctx.fillStyle = '#2f4a2a';
+            ctx.beginPath(); ctx.ellipse(0, -8 * g, 20 * g, 13 * g, 0, 0, Math.PI * 2); ctx.fill();
+            // spiky arms
+            ctx.strokeStyle = '#3d5c33'; ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            for (let arm of this.arms) {
+                let L = arm.len * g;
+                ctx.moveTo(0, -8 * g);
+                ctx.lineTo(Math.cos(arm.a) * L, -8 * g + Math.sin(arm.a) * L * 0.6);
+            }
+            ctx.stroke();
+            // thorns
+            ctx.fillStyle = '#d8d0a8';
+            for (let arm of this.arms) {
+                let L = arm.len * g;
+                let tx = Math.cos(arm.a) * L, ty = -8 * g + Math.sin(arm.a) * L * 0.6;
+                ctx.beginPath(); ctx.arc(tx, ty, 1.8 * g, 0, Math.PI * 2); ctx.fill();
+            }
+            // a few mean little berries
+            ctx.fillStyle = '#8b2f3f';
+            ctx.beginPath(); ctx.arc(-6 * g, -12 * g, 2.4 * g, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(7 * g, -6 * g, 2.4 * g, 0, Math.PI * 2); ctx.fill();
+            ctx.restore();
+        }
+    }
+
+    class RainCloud {
+        constructor() {
+            this.dir = Math.random() > 0.5 ? 1 : -1;
+            this.x = this.dir === 1 ? -80 : canvas.width + 80;
+            this.y = playArea.minY + 40 + Math.random() * (playArea.maxY - playArea.minY - 70);
+            this.stopX = playArea.minX + 100 + Math.random() * (playArea.maxX - playArea.minX - 200);
+            this.z = 95;               // floats above the field
+            this.speed = 1.6;
+            this.state = 'arrive';
+            this.rain = 60 * 4;
+            this.drops = [];
+            this.dropped = false;
+            this.active = true;
+        }
+        update() {
+            if (this.state === 'arrive') {
+                let dx = this.stopX - this.x;
+                if (Math.abs(dx) < 6) this.state = 'rain';
+                else this.x += Math.sign(dx) * this.speed;
+            } else if (this.state === 'rain') {
+                if (frameCount % 2 === 0) {
+                    this.drops.push({ x: (Math.random() - 0.5) * 54, y: 0, v: 3 + Math.random() * 2 });
+                }
+                if (--this.rain <= 0) {
+                    if (!this.dropped) { puddles.push(new Puddle(this.x, this.y)); this.dropped = true; }
+                    this.state = 'leave';
+                }
+            } else {
+                this.x += this.dir * this.speed;
+                if (this.x < -140 || this.x > canvas.width + 140) this.active = false;
+            }
+            for (let d of this.drops) d.y += d.v;
+            this.drops = this.drops.filter(d => d.y < this.z);
+        }
+        draw() {
+            ctx.save();
+            // rain
+            ctx.strokeStyle = 'rgba(150,190,225,0.75)'; ctx.lineWidth = 2;
+            ctx.beginPath();
+            for (let d of this.drops) {
+                ctx.moveTo(this.x + d.x, this.y - this.z + d.y);
+                ctx.lineTo(this.x + d.x, this.y - this.z + d.y + 6);
+            }
+            ctx.stroke();
+            // little grey cloud, about horse-sized
+            ctx.translate(this.x, this.y - this.z);
+            ctx.fillStyle = '#7d8894';
+            ctx.beginPath();
+            ctx.arc(-20, 0, 15, 0, Math.PI * 2);
+            ctx.arc(0, -6, 20, 0, Math.PI * 2);
+            ctx.arc(22, 0, 15, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#6b747f';
+            ctx.beginPath();
+            ctx.arc(-16, 6, 11, 0, Math.PI * 2);
+            ctx.arc(4, 8, 13, 0, Math.PI * 2);
+            ctx.arc(20, 5, 10, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+    }
+
+    // Everything a hen should think twice about walking into.
+    function killZones() {
+        let z = [];
+        for (let w of wolves) if (w.state !== 'leave') z.push({ x: w.x, y: w.y, kill: w.killR, scare: w.scareR });
+        for (let g of gators) if (g.emerge > 0.4) z.push({ x: g.x, y: g.y, kill: g.killR, scare: g.scareR });
+        return z;
+    }
+    function stickZones() {
+        let z = [];
+        for (let p of puddles) if (p.grow > 0.5) z.push({ x: p.x, y: p.y, r: p.stickR });
+        for (let t of thorns) if (t.grow > 0.5) z.push({ x: t.x, y: t.y, r: t.stickR });
+        return z;
+    }
+
+    // One roaming hazard at a time, so the yard never becomes unplayable.
+    function spawnRoamingHazard() {
+        let roll = Math.random();
+        if (roll < 0.4) {
+            wolves.push(new Wolf());
+            showBanner('A WOLF!', '#ff5a5a');
+            sndGrowl();
+        } else if (roll < 0.7) {
+            gators.push(new Gator());
+            showBanner('ALLIGATOR!', '#8aff6b');
+            sndGrowl();
+        } else {
+            farmers.push(new Farmer());
+            showBanner('ANGRY FARMER!', '#ffbe50');
+            sndDud();
+        }
+    }
+
+    // Is this spot a bad place to put corn? Used by the aiming reticle.
+    function spotDanger(x, y) {
+        for (let z of killZones()) if (dist(x, y, z.x, z.y) < z.kill + 60) return 'deadly';
+        for (let z of stickZones()) if (dist(x, y, z.x, z.y) < z.r + 30) return 'sticky';
+        for (let f of farmers) if (dist(x, y, f.x, f.y) < f.scareR) return 'farmer';
+        return null;
+    }
+
+    class Lightning {
+        constructor(x, y) {
+            this.x = x; this.y = y;
+            this.maxLife = 30;
+            this.life = this.maxLife;
+            this.active = true;
+            // Jagged path from the clouds down to the strike point
+            this.pts = [];
+            let cx = x;
+            let steps = Math.max(4, Math.floor(y / 26));
+            for (let i = 0; i <= steps; i++) {
+                let t = i / steps;
+                this.pts.push({ x: cx, y: t * y });
+                cx = x + (Math.random() - 0.5) * 34 * (1 - t) + (x - x) * t;
+            }
+            this.pts.push({ x: x, y: y });
+        }
+        update() {
+            this.life--;
+            if (this.life <= 0) this.active = false;
+        }
+        draw() {
+            // Only the first third of the life is the visible flash
+            let t = this.life / this.maxLife;
+            if (t < 0.55) return;
+            let a = (t - 0.55) / 0.45;
+            // flicker
+            if (Math.floor(this.life / 2) % 2 === 0 && t < 0.85) return;
+            ctx.save();
+            ctx.globalAlpha = a;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            // outer glow
+            ctx.strokeStyle = 'rgba(180,210,255,0.55)';
+            ctx.lineWidth = 9;
+            ctx.beginPath();
+            ctx.moveTo(this.pts[0].x, this.pts[0].y);
+            for (let p of this.pts) ctx.lineTo(p.x, p.y);
+            ctx.stroke();
+            // hot core
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(this.pts[0].x, this.pts[0].y);
+            for (let p of this.pts) ctx.lineTo(p.x, p.y);
+            ctx.stroke();
+            // scorch flare at the ground
+            ctx.fillStyle = 'rgba(255,255,220,' + (0.5 * a) + ')';
+            ctx.beginPath();
+            ctx.ellipse(this.x, this.y, 26, 10, 0, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+    }
+
+    // P key: call down a bolt. Foxes bolt for the exit and go home hungry.
+    function strikeLightning() {
+        if (boltCd > 0) return false;
+        boltCd = BOLT_COOLDOWN;
+
+        // Aim at a fox if there is one, otherwise just put on a show
+        let target = foxes.length > 0 ? foxes[0] : null;
+        let sx = target ? target.x : playArea.minX + Math.random() * (playArea.maxX - playArea.minX);
+        let sy = target ? target.y : playArea.minY + Math.random() * (playArea.maxY - playArea.minY);
+
+        bolts.push(new Lightning(sx, sy));
+        sndThunder();
+        flash = 1;
+        puff(sx, sy, 16, '#e8e4c8', 3.0);
+
+        for (let f of foxes) {
+            if (!f.scared && dist(f.x, f.y, sx, sy) < 400) {
+                f.scare(); foxesZapped++; addScore(100);
+            }
+        }
+        // Everyone else jumps out of their skin too
+        for (let c of chickens) {
+            if (c.z === 0 && c.vz === 0 && c.flutterCd <= 0 && dist(c.x, c.y, sx, sy) < 260) c.flutter(sx, sy);
+        }
+        for (let h of horses) h.spook(sx, sy);
+        return true;
+    }
+
+    class Bear {
+        constructor() {
+            this.dir = Math.random() > 0.5 ? 1 : -1;
+            this.x = this.dir === 1 ? -110 : canvas.width + 110;
+            this.y = playArea.minY + 30 + Math.random() * (playArea.maxY - playArea.minY - 30);
+            this.baseY = this.y;
+            this.speed = 2.6 + Math.random() * 1.2;
+            this.facingDir = this.dir;
+            this.walkCycle = 0;
+            this.dustCd = 0;
+            this.calledExodus = false;
+            this.active = true;
+        }
+        update() {
+            // Once it's properly on the field, the crazy ones go with it
+            if (!this.calledExodus &&
+                ((this.dir === 1 && this.x > canvas.width * 0.3) ||
+                 (this.dir === -1 && this.x < canvas.width * 0.7))) {
+                this.calledExodus = true;
+                let crazies = chickens.filter(c => c.crazy && c.state !== 'exodus');
+                if (crazies.length > 0) {
+                    showBanner('THE CRAZY ONES LEAVE!', '#ff6bcb',
+                        'The crazy chickens are flying away with the bear! Bye bye!');
+                    crazies.forEach(c => c.startExodus(this.dir));
+                }
+            }
+            this.x += this.speed * this.dir;
+            // lazy weave so it isn't a straight line
+            this.y = clampY(this.baseY + Math.sin(this.x * 0.012) * 18);
+            this.walkCycle += 0.26;
+            if (--this.dustCd <= 0) {
+                this.dustCd = 6;
+                puff(this.x - 20 * this.dir, this.y + 4, 2, '#8f9c6a', 1.0);
+            }
+            if ((this.dir === 1 && this.x > canvas.width + 130) ||
+                (this.dir === -1 && this.x < -130)) this.active = false;
+        }
+        draw() {
+            drawShadow(this.x, this.y, 32, 12);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir, 1);
+            // lumbering bound
+            ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 5);
+
+            let front = Math.sin(this.walkCycle) * 11;
+            let back = Math.sin(this.walkCycle + 2.4) * 11;
+
+            // Legs
+            ctx.strokeStyle = '#3a2416'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(-16, 0); ctx.lineTo(-16 + back, 18);
+            ctx.moveTo(-6, 0); ctx.lineTo(-6 + back * 0.8, 18);
+            ctx.moveTo(12, 0); ctx.lineTo(12 + front * 0.8, 18);
+            ctx.moveTo(21, 0); ctx.lineTo(21 + front, 18);
+            ctx.stroke();
+            ctx.lineCap = 'butt';
+
+            // Body with a shoulder hump
+            ctx.fillStyle = '#4a2f1c';
+            ctx.beginPath(); ctx.ellipse(0, -10, 27, 15, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(8, -20, 13, 9, 0, 0, Math.PI * 2); ctx.fill();
+
+            // Head
+            ctx.beginPath(); ctx.ellipse(28, -18, 13, 11, 0, 0, Math.PI * 2); ctx.fill();
+            // Ears
+            ctx.beginPath(); ctx.arc(23, -28, 5, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(34, -27, 5, 0, Math.PI * 2); ctx.fill();
+            // Muzzle
+            ctx.fillStyle = '#8a6a4a';
+            ctx.beginPath(); ctx.ellipse(38, -14, 8, 6, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#1a1008';
+            ctx.beginPath(); ctx.arc(44, -15, 3, 0, Math.PI * 2); ctx.fill();
+            // Eye
+            ctx.fillRect(30, -22, 3, 3);
+
+            ctx.restore();
+        }
+    }
+
+    class SkyBird {
+        constructor(x, y, dir, speed, scale) {
+            this.x = x; this.y = y;
+            this.dir = dir;
+            this.speed = speed;
+            this.scale = scale;
+            this.flap = Math.random() * Math.PI * 2;
+            this.active = true;
+        }
+        update() {
+            this.x += this.speed * this.dir;
+            this.y += Math.sin(this.x * 0.008) * 0.12;
+            this.flap += 0.22;
+            if (this.x < -60 || this.x > canvas.width + 60) this.active = false;
+        }
+        draw() {
+            let s = this.scale;
+            let w = Math.sin(this.flap);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.dir * s, s);
+            ctx.strokeStyle = 'rgba(40,50,60,0.75)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(-7, w * 4);
+            ctx.quadraticCurveTo(-3, -3 - w * 2, 0, 0);
+            ctx.quadraticCurveTo(3, -3 - w * 2, 7, w * 4);
+            ctx.stroke();
+            ctx.restore();
+        }
+    }
+
+    function spawnFlock() {
+        let dir = Math.random() > 0.5 ? 1 : -1;
+        let n = 3 + Math.floor(Math.random() * 4);
+        let y = 45 + Math.random() * 95;
+        let x = dir === 1 ? -40 : canvas.width + 40;
+        let speed = 0.7 + Math.random() * 0.8;
+        let scale = 0.7 + Math.random() * 0.6;
+        for (let i = 0; i < n; i++) {
+            // loose V formation
+            skyBirds.push(new SkyBird(
+                x - dir * i * 16,
+                y + Math.abs(i - (n - 1) / 2) * 7 + (Math.random() - 0.5) * 4,
+                dir, speed, scale
+            ));
+        }
+    }
+
+    // The fox is an opportunist: it goes for the fattest, slowest bird out there.
+    function pickPrey(forFox) {
+        // Prefer the fattest bird nobody else is already hunting, so a whole
+        // wave of foxes threatens several chickens instead of ganging up on one.
+        let taken = new Set();
+        for (let f of foxes) {
+            if (f !== forFox && f.targetChicken && !f.targetChicken.dead) taken.add(f.targetChicken);
+        }
+        let best = null, bestFree = null;
+        for (let c of chickens) {
+            if (c.dead || c.state === 'exodus' || c.state === 'toCoop') continue;
+            if (!best || c.fatness > best.fatness) best = c;
+            if (!taken.has(c) && (!bestFree || c.fatness > bestFree.fatness)) bestFree = c;
+        }
+        return bestFree || best;
+    }
+
+    // ============================================================
+    //  WINNING: the coop, the confetti, and the parade inside
+    // ============================================================
+
+    class Coop {
+        constructor(x, y) {
+            this.x = x; this.y = y;
+            this.doorX = x;        // chickens walk to here
+            this.doorY = y + 4;
+        }
+        draw() {
+            drawShadow(this.x, this.y, 62, 16);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            // back wall / body
+            ctx.fillStyle = '#b23c2e';
+            ctx.fillRect(-55, -70, 110, 74);
+            // roof
+            ctx.fillStyle = '#7a2820';
+            ctx.beginPath();
+            ctx.moveTo(-64, -66); ctx.lineTo(0, -104); ctx.lineTo(64, -66);
+            ctx.closePath(); ctx.fill();
+            // roof ridge
+            ctx.fillStyle = '#5f1f18';
+            ctx.fillRect(-64, -70, 128, 6);
+            // white trim
+            ctx.fillStyle = '#f4ede0';
+            ctx.fillRect(-55, -20, 110, 6);
+            // round doorway
+            ctx.fillStyle = '#2a1712';
+            ctx.beginPath();
+            ctx.arc(0, -8, 18, Math.PI, 0);
+            ctx.fill();
+            ctx.fillRect(-18, -8, 36, 12);
+            // little ramp
+            ctx.fillStyle = '#8a6a3a';
+            ctx.fillRect(-14, 4, 28, 6);
+            // a window with a heart
+            ctx.fillStyle = '#ffd45e';
+            ctx.beginPath(); ctx.arc(-34, -44, 9, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(34, -44, 9, 0, Math.PI * 2); ctx.fill();
+            // sign
+            ctx.fillStyle = '#f4ede0';
+            ctx.fillRect(-30, -96, 60, 16);
+            ctx.fillStyle = '#7a2820';
+            ctx.font = 'bold 11px "Courier New", monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('HEN HOUSE', 0, -84);
+            ctx.textAlign = 'left';
+            // a rooster weathervane
+            ctx.strokeStyle = '#5f1f18'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(0, -104); ctx.lineTo(0, -116); ctx.stroke();
+            ctx.fillStyle = '#e8a020';
+            ctx.beginPath();
+            ctx.moveTo(-6, -116); ctx.lineTo(6, -120); ctx.lineTo(2, -114);
+            ctx.lineTo(8, -112); ctx.lineTo(-6, -110); ctx.closePath(); ctx.fill();
+            ctx.restore();
+        }
+    }
+
+    function spawnConfetti(n) {
+        const cols = ['#ff5a7a', '#ffd23b', '#4dd2ff', '#8aff6b', '#c58bff', '#ff9b54', '#ffffff'];
+        for (let i = 0; i < n; i++) {
+            confetti.push({
+                x: Math.random() * canvas.width,
+                y: -10 - Math.random() * 60,
+                vx: (Math.random() - 0.5) * 1.6,
+                vy: 1.4 + Math.random() * 2.2,
+                rot: Math.random() * Math.PI,
+                vr: (Math.random() - 0.5) * 0.3,
+                w: 5 + Math.random() * 5,
+                h: 7 + Math.random() * 6,
+                col: cols[(Math.random() * cols.length) | 0],
+                sway: Math.random() * Math.PI * 2
+            });
+        }
+    }
+
+    function updateConfetti() {
+        for (let c of confetti) {
+            c.sway += 0.1;
+            c.x += c.vx + Math.sin(c.sway) * 0.8;
+            c.y += c.vy;
+            c.rot += c.vr;
+        }
+        confetti = confetti.filter(c => c.y < canvas.height + 20);
+    }
+
+    function drawConfetti() {
+        for (let c of confetti) {
+            ctx.save();
+            ctx.translate(c.x, c.y);
+            ctx.rotate(c.rot);
+            ctx.fillStyle = c.col;
+            ctx.fillRect(-c.w / 2, -c.h / 2, c.w, c.h);
+            ctx.restore();
+        }
+    }
+
+    // Kick off the victory: build the coop and send the flock marching in.
+    function startWin() {
+        gameState = 'winning';
+        winHoldTimer = 0;
+        coop = new Coop(canvas.width / 2, horizonY + 78);
+        // clear the hazards so nothing eats a chicken during the parade
+        foxes.length = 0;
+        bears.length = 0;
+        rabbits.length = 0;
+        for (let c of chickens) { c.state = 'toCoop'; c.releaseFood(); }
+        showBanner('YOU DID IT!', '#ffd23b');
+        sndFanfare();
+        spawnConfetti(120);
+    }
+
+    function finishWin() {
+        gameState = 'won';
+        showBanner('YOU WIN!', '#ffd23b');
+        sndFanfare();
+    }
+
+    // Wipe the board and start a brand new game.
+    function restartGame() {
+        chickens = []; horses = []; cows = []; foxes = []; eggs = [];
+        foods = []; bags = []; particles = []; bears = []; skyBirds = [];
+        bolts = []; grasses = []; rabbits = []; poops = []; flies = [];
+        confetti = []; coop = null; chickensHoused = 0;
+        wolves = []; gators = []; farmers = []; puddles = []; thorns = []; rainClouds = [];
+        stuckLosses = 0;
+        nextHazardAt = frameCount + 60 * 25;
+        nextRainAt = frameCount + 60 * 34;
+        nextThornAt = frameCount + 60 * 45;
+        score = 0; scorePop = 0;
+        chickensLost = 0; foxesZapped = 0; chickensStarved = 0;
+        grassStolen = 0; cowMeals = 0; crazyDeparted = 0;
+        boltCd = 0; boltDeny = 0; flash = 0; denyFlash = 0;
+        banner = null;
+        eggBoomDone = false; crazyEraAnnounced = false;
+        cornReady = CORN_MAG; cornRefillCd = CORN_REFILL_FRAMES; cornThrowCd = 0;
+        gameState = 'playing';
+        // reset the timed events relative to now
+        nextBearAt = frameCount + 60 * (25 + Math.random() * 45);
+        nextFlockAt = frameCount + 60 * (5 + Math.random() * 8);
+        nextGrassAt = frameCount + 60 * 2;
+        nextRabbitAt = frameCount + 60 * 6;
+        nextFlyAt = frameCount + 60 * 4;
+        gameStartFrame = frameCount;
+        seedWorld();
+    }
+
+    // --- ENVIRONMENT ---
+
+    // Grass tufts, generated once so they don't crawl around every frame
+    const tufts = [];
+    (function seedTufts() {
+        let seed = 1337;
+        function rnd() { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; }
+        for (let i = 0; i < 90; i++) {
+            tufts.push({
+                x: rnd() * canvas.width,
+                y: horizonY + 30 + rnd() * (canvas.height - horizonY - 30),
+                h: 3 + rnd() * 4,
+                shade: rnd() > 0.5 ? '#5b8f5a' : '#71a870'
+            });
+        }
+    })();
+
+    let cloudOffset = 0;
+
+    function drawBackground() {
+        // Sky
+        ctx.fillStyle = '#87CEEB';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Drifting clouds
+        cloudOffset = (cloudOffset + 0.12) % (canvas.width + 200);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+        function cloud(cx, cy, s) {
+            let x = ((cx + cloudOffset) % (canvas.width + 200)) - 100;
+            ctx.beginPath();
+            ctx.arc(x, cy, 30 * s, 0, Math.PI * 2);
+            ctx.arc(x + 40 * s, cy, 40 * s, 0, Math.PI * 2);
+            ctx.arc(x + 80 * s, cy, 30 * s, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        cloud(canvas.width * 0.12, 80, 1);
+        cloud(canvas.width * 0.55, 130, 0.7);
+        cloud(canvas.width * 0.34, 55, 0.5);
+        cloud(canvas.width * 0.80, 95, 0.85);
+
+        // Birds passing overhead -- pure scenery, they never land
+        skyBirds.forEach(b => b.draw());
+
+        // Hills -- rolling all the way across, whatever the width
+        let W = canvas.width;
+        ctx.fillStyle = '#4a7c49';
+        ctx.beginPath();
+        ctx.moveTo(0, horizonY);
+        let humps = Math.max(2, Math.round(W / 400));
+        for (let i = 0; i < humps; i++) {
+            let x0 = (W / humps) * i, x1 = (W / humps) * (i + 1);
+            let h = (i % 2 === 0) ? 80 : 120;
+            ctx.quadraticCurveTo((x0 + x1) / 2, horizonY - h, x1, horizonY);
+        }
+        ctx.lineTo(W, horizonY); ctx.lineTo(0, horizonY); ctx.fill();
+
+        // Ground
+        ctx.fillStyle = '#659c64'; ctx.fillRect(0, horizonY, canvas.width, canvas.height - horizonY);
+
+        // Grass tufts, all swaying together
+        let sway = Math.sin(frameCount * 0.03) * 1.5;
+        ctx.lineWidth = 2;
+        for (let t of tufts) {
+            ctx.strokeStyle = t.shade;
+            ctx.beginPath();
+            ctx.moveTo(t.x, t.y);
+            ctx.lineTo(t.x + sway, t.y - t.h);
+            ctx.stroke();
+        }
+
+        // Fence
+        ctx.strokeStyle = '#5c4033'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(0, horizonY + 10); ctx.lineTo(W, horizonY + 10);
+        ctx.moveTo(0, horizonY + 25); ctx.lineTo(W, horizonY + 25); ctx.stroke();
+        ctx.fillStyle = '#5c4033';
+        for (let x = 20; x < W; x += 80) ctx.fillRect(x, horizonY - 5, 6, 40);
+    }
+
+    function horseSizeLabel(p) {
+        if (p < 0.12) return 'LEAN';
+        if (p < 0.30) return 'WELL FED';
+        if (p < 0.48) return 'CHONKY';
+        if (p < 0.66) return 'ROTUND';
+        if (p < 0.82) return 'ENORMOUS';
+        if (p < 0.95) return 'ABSURD';
+        return 'A BOULDER';
+    }
+
+    // Title block, drawn on the canvas so it scales with everything else
+    function drawTitle() {
+        ctx.textAlign = 'left';
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.font = 'bold 30px "Courier New", monospace';
+        ctx.fillText('Farm Yard Chaos', 22, 44);
+        ctx.fillStyle = '#FFD700';
+        ctx.fillText('Farm Yard Chaos', 20, 42);
+
+        let keys = 'CLICK to drop corn    P = lightning    F = fullscreen    M = ' +
+            (soundOn ? 'mute' : 'UNMUTE');
+        ctx.font = 'bold 15px "Courier New", monospace';
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillText(keys, 22, 68);
+        ctx.fillStyle = soundOn ? '#ffffff' : '#ffb0b0';
+        ctx.fillText(keys, 20, 66);
+
+        ctx.font = 'bold 12px "Courier New", monospace';
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+        ctx.fillText('Drop corn in SAFE spots. Red = danger!', 20, 104);
+    }
+
+    // Audio can't start until the player touches something, so ask them to.
+    function drawStartGate() {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.textAlign = 'center';
+        let cx = canvas.width / 2, cy = canvas.height / 2;
+        let pulse = 1 + Math.sin(frameCount * 0.06) * 0.04;
+        ctx.translate(cx, cy); ctx.scale(pulse, pulse);
+        ctx.font = 'bold 44px "Courier New", monospace';
+        ctx.fillStyle = '#000000';
+        ctx.fillText('CLICK TO START', 3, 3);
+        ctx.fillStyle = '#FFD700';
+        ctx.fillText('CLICK TO START', 0, 0);
+        ctx.font = 'bold 20px "Courier New", monospace';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('( click the grass to drop corn )', 0, 42);
+        ctx.restore();
+        ctx.textAlign = 'left';
+    }
+
+    // The goal, front and centre: score, a progress bar to victory, and the
+    // lightning recharge so kids can see why P isn't firing.
+    function drawGoalBar() {
+        let cx = canvas.width / 2;
+
+        // SCORE -- big, with a little bounce when it just went up
+        ctx.textAlign = 'center';
+        let s = 1 + scorePop * 0.25;
+        ctx.save();
+        ctx.translate(cx, 40);
+        ctx.scale(s, s);
+        ctx.font = 'bold 30px "Courier New", monospace';
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillText('SCORE ' + score, 2, 2);
+        ctx.fillStyle = '#FFD700';
+        ctx.fillText('SCORE ' + score, 0, 0);
+        ctx.restore();
+
+        // GOAL bar -- plump chickens toward the win
+        let have = Math.min(WIN_PLUMP, plumpCount());
+        let bw = 300, bh = 22, bx = cx - bw / 2, by = 92;
+        ctx.font = 'bold 13px "Courier New", monospace';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('GOAL: raise ' + WIN_PLUMP + ' plump chickens', cx, by - 6);
+        // track
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(bx - 2, by - 2, bw + 4, bh + 4);
+        ctx.fillStyle = 'rgba(255,255,255,0.15)';
+        ctx.fillRect(bx, by, bw, bh);
+        // fill
+        let fillW = bw * (have / WIN_PLUMP);
+        ctx.fillStyle = '#8aff6b';
+        ctx.fillRect(bx, by, fillW, bh);
+        // segment ticks
+        ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 1;
+        for (let i = 1; i < WIN_PLUMP; i++) {
+            let x = bx + (bw / WIN_PLUMP) * i;
+            ctx.beginPath(); ctx.moveTo(x, by); ctx.lineTo(x, by + bh); ctx.stroke();
+        }
+        ctx.fillStyle = '#123';
+        ctx.font = 'bold 14px "Courier New", monospace';
+        ctx.fillText(have + ' / ' + WIN_PLUMP, cx, by + bh - 6);
+
+        // LIGHTNING recharge meter
+        let lw = 200, lx = cx - lw / 2, ly = by + bh + 10, lh = 8;
+        let ready = boltCd <= 0;
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(lx - 2, ly - 2, lw + 4, lh + 4);
+        ctx.fillStyle = 'rgba(255,255,255,0.15)';
+        ctx.fillRect(lx, ly, lw, lh);
+        let frac = ready ? 1 : 1 - boltCd / BOLT_COOLDOWN;
+        ctx.fillStyle = ready ? '#9ad8ff' : '#4a7ba6';
+        ctx.fillRect(lx, ly, lw * frac, lh);
+        ctx.font = 'bold 11px "Courier New", monospace';
+        if (ready) {
+            ctx.fillStyle = (boltDeny > 0) ? '#ffffff' : '#9ad8ff';
+            ctx.fillText('LIGHTNING READY  (press P)', cx, ly + lh + 12);
+        } else {
+            ctx.fillStyle = (boltDeny > 0 && Math.floor(frameCount / 4) % 2 === 0) ? '#ff8080' : '#bcdcf0';
+            ctx.fillText('lightning charging... ' + Math.ceil(boltCd / 60) + 's', cx, ly + lh + 12);
+        }
+
+        // CORN handfuls -- a row of kernels that empty as you throw and refill
+        // over time, so the player can see when to feed.
+        let ky = ly + lh + 22, kn = CORN_MAG, kgap = 22, kx = cx - (kn - 1) * kgap / 2;
+        ctx.font = 'bold 11px "Courier New", monospace';
+        ctx.textAlign = 'right';
+        ctx.fillStyle = (denyFlash > 0 && Math.floor(frameCount / 4) % 2 === 0) ? '#ff8080' : '#e0c060';
+        ctx.fillText('CORN', kx - 16, ky + 5);
+        ctx.textAlign = 'center';
+        for (let i = 0; i < kn; i++) {
+            let hx = kx + i * kgap, full = i < cornReady;
+            // refilling kernel grows in
+            let grow = (i === cornReady && cornReady < CORN_MAG) ? (1 - cornRefillCd / CORN_REFILL_FRAMES) : (full ? 1 : 0);
+            ctx.globalAlpha = full ? 1 : (i === cornReady ? 0.35 + grow * 0.5 : 0.18);
+            let r = 5 * (full ? 1 : Math.max(0.5, grow));
+            ctx.fillStyle = full ? '#ffcc00' : '#b8a24a';
+            ctx.beginPath(); ctx.ellipse(hx, ky, r, r * 1.3, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.globalAlpha = 1;
+        }
+        ctx.textAlign = 'left';
+    }
+
+    // Paint the unsafe patches onto the grass so it's obvious where NOT to feed.
+    function drawHazardHints() {
+        if (gameState !== 'playing') return;
+        let pulse = 0.5 + Math.sin(frameCount * 0.07) * 0.5;
+        for (let z of killZones()) {
+            ctx.save();
+            ctx.fillStyle = 'rgba(220,40,40,' + (0.10 + 0.06 * pulse) + ')';
+            ctx.beginPath(); ctx.ellipse(z.x, z.y, z.kill + 55, (z.kill + 55) * 0.45, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = 'rgba(255,70,70,' + (0.35 + 0.25 * pulse) + ')';
+            ctx.lineWidth = 2; ctx.setLineDash([8, 7]);
+            ctx.beginPath(); ctx.ellipse(z.x, z.y, z.kill + 55, (z.kill + 55) * 0.45, 0, 0, Math.PI * 2); ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.restore();
+        }
+        for (let f of farmers) {
+            ctx.save();
+            ctx.strokeStyle = 'rgba(255,190,80,' + (0.22 + 0.18 * pulse) + ')';
+            ctx.lineWidth = 2; ctx.setLineDash([6, 9]);
+            ctx.beginPath(); ctx.ellipse(f.x, f.y, f.scareR, f.scareR * 0.45, 0, 0, Math.PI * 2); ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.restore();
+        }
+    }
+
+    // Crosshair showing where the corn will land, and whether that's a good idea.
+    function drawReticle() {
+        if (gameState !== 'playing' || !mouseIn) return;
+        let d = spotDanger(mouseX, mouseY);
+        let col = d === 'deadly' ? '#ff4040' : d === 'sticky' ? '#b98a4a' : d === 'farmer' ? '#ffbe50' : '#8aff6b';
+        let scatter = 46;
+        ctx.save();
+        ctx.globalAlpha = cornReady > 0 ? 1 : 0.35;
+        ctx.strokeStyle = col; ctx.lineWidth = 2;
+        // scatter footprint
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath(); ctx.ellipse(mouseX, mouseY, scatter, scatter * 0.45, 0, 0, Math.PI * 2); ctx.stroke();
+        ctx.setLineDash([]);
+        // crosshair
+        ctx.beginPath();
+        ctx.moveTo(mouseX - 13, mouseY); ctx.lineTo(mouseX - 4, mouseY);
+        ctx.moveTo(mouseX + 4, mouseY); ctx.lineTo(mouseX + 13, mouseY);
+        ctx.moveTo(mouseX, mouseY - 9); ctx.lineTo(mouseX, mouseY - 3);
+        ctx.moveTo(mouseX, mouseY + 3); ctx.lineTo(mouseX, mouseY + 9);
+        ctx.stroke();
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(mouseX, mouseY, 2, 0, Math.PI * 2); ctx.fill();
+        // warning word
+        if (d) {
+            ctx.textAlign = 'center';
+            ctx.font = 'bold 12px "Courier New", monospace';
+            let msg = d === 'deadly' ? 'DANGER!' : d === 'sticky' ? 'STICKY!' : 'HE WILL SHOO THEM!';
+            ctx.fillStyle = 'rgba(0,0,0,0.65)';
+            ctx.fillText(msg, mouseX + 1, mouseY - 17);
+            ctx.fillStyle = col;
+            ctx.fillText(msg, mouseX, mouseY - 18);
+            ctx.textAlign = 'left';
+        }
+        ctx.restore();
+    }
+
+    function drawHUD() {
+        if (gameState === 'playing') drawGoalBar();
+
+        let fattest = 0;
+        for (let c of chickens) if (c.fatness > fattest) fattest = c.fatness;
+
+        ctx.font = 'bold 16px "Courier New", monospace';
+        ctx.textAlign = 'right';
+        let left = bagsLeft();
+        let crazyN = chickens.filter(c => c.crazy).length;
+        let hungryN = chickens.filter(c => c.hunger > HUNGER_WARN).length;
+        let horsePlump = horses.length ? horses[0].plump : 0;
+        let lines = [
+            ['CHICKENS ' + chickens.length + (crazyN ? '  (' + crazyN + ' CRAZY)' : ''),
+                crazyN ? '#ff6bcb' : '#FFD700'],
+            ['CORN ' + left + '/' + CORN_MAG, left > 0 ? '#FFD700' : '#ff8080'],
+            ['HUNGRY ' + hungryN, hungryN > 0 ? '#ffa53b' : '#FFD700'],
+            ['FATTEST ' + fattest.toFixed(2) + 'x', '#FFD700'],
+            ['HORSE: ' + horseSizeLabel(horsePlump), horsePlump > 0.75 ? '#ffb060' : '#e0b080'],
+            ['FOX ' + chickensLost + '  STARVED ' + chickensStarved,
+                (chickensLost || chickensStarved) ? '#ff8080' : '#FFD700'],
+            ['ZAPPED ' + foxesZapped + '  FLEW OFF ' + crazyDeparted, '#9ad8ff'],
+            ['GRASS ' + grasses.filter(g => g.ripe).length + '/' + grasses.length +
+                '  COW ' + cowMeals + '  RAB ' + grassStolen, '#b6ee6a']
+        ];
+        for (let i = 0; i < lines.length; i++) {
+            let y = 26 + i * 18;
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillText(lines[i][0], canvas.width - 18, y + 2);
+            ctx.fillStyle = lines[i][1];
+            ctx.fillText(lines[i][0], canvas.width - 20, y);
+        }
+
+        // Countdown hints
+        ctx.font = 'bold 12px "Courier New", monospace';
+        let toEgg = Math.ceil((EGG_SPAWN_FRAMES - (frameCount % EGG_SPAWN_FRAMES)) / 60);
+        let toFox = Math.ceil((FOX_SPAWN_FRAMES - (frameCount % FOX_SPAWN_FRAMES)) / 60);
+        ctx.fillStyle = 'rgba(255,255,255,0.9)';
+        ctx.fillText('egg in ' + toEgg + 's   fox in ' + toFox + 's', canvas.width - 20, 190);
+        if (left < CORN_MAG) {
+            ctx.fillStyle = '#ffb0b0';
+            ctx.fillText('more corn in ' + Math.ceil(cornRefillCd / 60) + 's', canvas.width - 20, 206);
+        }
+        ctx.textAlign = 'left';
+
+        // Big event announcement
+        if (banner) {
+            banner.life--;
+            if (banner.life <= 0) { banner = null; }
+            else {
+                let t = banner.life / banner.maxLife;
+                let pop = t > 0.85 ? (1 - t) / 0.15 : 1; // quick scale-in
+                ctx.save();
+                ctx.textAlign = 'center';
+                ctx.translate(canvas.width / 2, horizonY + 90);
+                ctx.scale(0.7 + 0.3 * pop, 0.7 + 0.3 * pop);
+                ctx.globalAlpha = Math.min(1, t * 3);
+                ctx.font = 'bold 30px "Courier New", monospace';
+                ctx.fillStyle = 'rgba(0,0,0,0.65)';
+                ctx.fillText(banner.text, 3, 3);
+                ctx.fillStyle = banner.color;
+                ctx.fillText(banner.text, 0, 0);
+                ctx.restore();
+                ctx.textAlign = 'left';
+                ctx.globalAlpha = 1;
+            }
+        }
+
+        // "Out of corn" nag, centred
+        if (denyFlash > 0) {
+            ctx.textAlign = 'center';
+            ctx.font = 'bold 20px "Courier New", monospace';
+            ctx.globalAlpha = Math.min(1, denyFlash / 25);
+            ctx.fillStyle = 'rgba(0,0,0,0.7)';
+            ctx.fillText('OUT OF CORN!', canvas.width / 2 + 2, horizonY + 152);
+            ctx.fillStyle = '#ffd0d0';
+            ctx.fillText('OUT OF CORN!', canvas.width / 2, horizonY + 150);
+            ctx.globalAlpha = 1;
+            ctx.textAlign = 'left';
+        }
+
+        // The loser's screen
+        if (gameState === 'lost') {
+            let cx = canvas.width / 2, cy = canvas.height / 2;
+            ctx.save();
+            ctx.fillStyle = 'rgba(20,0,0,0.45)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.textAlign = 'center';
+            ctx.font = 'bold 60px "Courier New", monospace';
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillText('THE FLOCK IS GONE', cx + 3, cy - 47);
+            ctx.fillStyle = '#ff8080';
+            ctx.fillText('THE FLOCK IS GONE', cx, cy - 50);
+            ctx.font = 'bold 24px "Courier New", monospace';
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('Keep the corn away from the wolf, the gator, the mud and the thorns!', cx, cy + 4);
+            ctx.font = 'bold 30px "Courier New", monospace';
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('SCORE: ' + score, cx, cy + 48);
+            let p = 0.6 + 0.4 * Math.sin(frameCount * 0.08);
+            ctx.globalAlpha = p;
+            ctx.font = 'bold 22px "Courier New", monospace';
+            ctx.fillStyle = '#ffd23b';
+            ctx.fillText('press SPACE or CLICK to try again', cx, cy + 96);
+            ctx.globalAlpha = 1;
+            ctx.textAlign = 'left';
+            ctx.restore();
+        }
+
+        // The winner's screen
+        if (gameState === 'won') {
+            let cx = canvas.width / 2, cy = canvas.height / 2;
+            ctx.textAlign = 'center';
+            let bob = Math.sin(frameCount * 0.05) * 6;
+            ctx.save();
+            ctx.translate(cx, cy - 60 + bob);
+            ctx.font = 'bold 72px "Courier New", monospace';
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillText('YOU WIN!', 4, 4);
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText('YOU WIN!', 0, 0);
+            ctx.restore();
+
+            ctx.font = 'bold 30px "Courier New", monospace';
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('All the chickens are safe in the coop!', cx, cy + 10);
+
+            ctx.font = 'bold 34px "Courier New", monospace';
+            ctx.fillStyle = '#8aff6b';
+            ctx.fillText('FINAL SCORE: ' + score, cx, cy + 56);
+
+            // gentle pulsing "play again" prompt
+            let p = 0.6 + 0.4 * Math.sin(frameCount * 0.08);
+            ctx.globalAlpha = p;
+            ctx.font = 'bold 22px "Courier New", monospace';
+            ctx.fillStyle = '#ffd23b';
+            ctx.fillText('press SPACE to play again', cx, cy + 104);
+            ctx.globalAlpha = 1;
+            ctx.textAlign = 'left';
+        }
+    }
+
+    // --- MAIN LOGIC ---
+
+    // Seed a fresh farm: 1 cow, 1 horse, a small spread-out flock.
+    function seedWorld() {
+        cows.push(new Cow(canvas.width * 0.3, canvas.height * 0.7));
+        horses.push(new Horse(canvas.width * 0.65, canvas.height * 0.5));
+        const startCount = 4;
+        for (let i = 0; i < startCount; i++) {
+            let band = (playArea.maxX - playArea.minX) / startCount;
+            chickens.push(new Chicken(
+                playArea.minX + band * (i + 0.15 + Math.random() * 0.7),
+                playArea.minY + Math.random() * (playArea.maxY - playArea.minY),
+                1.0
+            ));
+        }
+    }
+
+    function init() {
+        seedWorld();
+        requestAnimationFrame(gameLoop);
+    }
+
+    // Browsers won't let audio start until the player interacts
+    window.addEventListener('pointerdown', initAudio);
+    window.addEventListener('keydown', initAudio);
+
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'KeyM') {
+            e.preventDefault();
+            soundOn = !soundOn;
+            if (masterGain) masterGain.gain.value = soundOn ? 0.9 : 0;
+            return;
+        }
+        if (e.code === 'Space') {
+            e.preventDefault();
+            // Guard key-repeat FIRST -- otherwise holding space on the win
+            // screen would restart the game dozens of times a second.
+            if (e.repeat) return;
+            if (gameState === 'won' || gameState === 'lost') { restartGame(); return; }
+            spaceHeld = true;       // hold to keep feeding at the capped rate
+            throwCorn();            // immediate throw for a responsive first tap
+        } else if (e.code === 'KeyP') {
+            e.preventDefault();
+            if (gameState === 'playing' && !strikeLightning()) {
+                boltDeny = 45; // pressed while still charging
+                sndDud();
+            }
+        } else if (e.code === 'KeyF') {
+            e.preventDefault();
+            let stage = document.getElementById('game-container');
+            if (!document.fullscreenElement) {
+                if (stage.requestFullscreen) stage.requestFullscreen();
+                else if (stage.webkitRequestFullscreen) stage.webkitRequestFullscreen();
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+                else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            }
+        }
+    });
+
+    // --- Mouse: aim and place the corn ---
+    canvas.addEventListener('mousemove', (e) => {
+        let p = canvasPos(e);
+        mouseX = clampX(p.x); mouseY = clampY(p.y);
+        mouseIn = p.y > horizonY - 10;
+    });
+    canvas.addEventListener('mouseleave', () => { mouseIn = false; });
+    canvas.addEventListener('mousedown', (e) => {
+        initAudio();
+        if (e.button !== 0) return;
+        e.preventDefault();
+        if (gameState === 'won' || gameState === 'lost') { restartGame(); return; }
+        let p = canvasPos(e);
+        mouseX = clampX(p.x); mouseY = clampY(p.y); mouseIn = true;
+        throwCorn(mouseX, mouseY);
+    });
+    // Touch: same thing, so it works on a tablet
+    canvas.addEventListener('touchstart', (e) => {
+        initAudio();
+        if (!e.touches.length) return;
+        e.preventDefault();
+        let t = e.touches[0];
+        let r = canvas.getBoundingClientRect();
+        let x = clampX((t.clientX - r.left) * (canvas.width / r.width));
+        let y = clampY((t.clientY - r.top) * (canvas.height / r.height));
+        if (gameState === 'won' || gameState === 'lost') { restartGame(); return; }
+        mouseX = x; mouseY = y; mouseIn = true;
+        throwCorn(x, y);
+    }, { passive: false });
+
+    window.addEventListener('keyup', (e) => {
+        if (e.code === 'Space') spaceHeld = false;
+    });
+    // If focus is lost mid-hold, stop feeding
+    window.addEventListener('blur', () => { spaceHeld = false; });
+
+    function gameLoop() {
+        // Draw the whole scene into the low-res buffer using logical 800x600 coords
+        ctx.setTransform(1 / PIXEL, 0, 0, 1 / PIXEL, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawBackground();
+        // Ground-level hazards paint onto the grass, under everything else
+        puddles.forEach(p => p.draw());
+        drawHazardHints();
+
+        frameCount++;
+
+        // Sky birds keep drifting even after you win -- pure scenery
+        if (frameCount >= nextFlockAt) {
+            spawnFlock();
+            nextFlockAt = frameCount + 60 * (6 + Math.random() * 10);
+        }
+
+        // Hazards, hatching and the goal check only run during active play.
+        if (gameState === 'playing') {
+
+        // You win the moment you have enough plump chickens
+        if (plumpCount() >= WIN_PLUMP) startWin();
+
+        // Spawn Mechanics
+        if (frameCount % EGG_SPAWN_FRAMES === 0) {
+            // A chicken lays it where it stands, if there is anyone left to lay it
+            let layer = chickens.length > 0 ? chickens[Math.floor(Math.random() * chickens.length)] : null;
+            if (chickens.length + eggs.length < CHICKEN_CAP) {
+                let e = new Egg(
+                    layer ? layer.x : playArea.minX + Math.random() * (playArea.maxX - playArea.minX),
+                    layer ? layer.y : playArea.minY + Math.random() * (playArea.maxY - playArea.minY)
+                );
+                e.crazy = crazyEra();
+                eggs.push(e);
+            }
+        }
+        if (frameCount % FOX_SPAWN_FRAMES === 0) {
+            // Foxes attack in bigger waves the closer you are to winning
+            let prog = plumpCount() / WIN_PLUMP;
+            let n = prog >= 0.7 ? 3 : (prog >= 0.4 ? 2 : 1);
+            for (let i = 0; i < n; i++) foxes.push(new Fox());
+            sndYip();
+            if (n > 1) showBanner(n + ' FOXES!', '#ff8080');
+        }
+        // A bear. No reason. It just runs through sometimes.
+        if (frameCount >= nextBearAt) {
+            bears.push(new Bear());
+            sndGrowl();
+            nextBearAt = frameCount + 60 * (35 + Math.random() * 55);
+        }
+        // A new clump of grass sprouts somewhere with elbow room
+        if (frameCount >= nextGrassAt) {
+            trySpawnGrass();
+            nextGrassAt = frameCount + 60 * (3 + Math.random() * 4);
+        }
+
+        // --- Hazards ---
+        // One roaming hazard (wolf / gator / farmer) at a time.
+        if (frameCount >= nextHazardAt) {
+            if (wolves.length + gators.length + farmers.length === 0) {
+                spawnRoamingHazard();
+                nextHazardAt = frameCount + 60 * (38 + Math.random() * 24);
+            } else {
+                nextHazardAt = frameCount + 60 * 5; // busy -- check back shortly
+            }
+        }
+        // A little rain cloud drifts in and leaves a puddle behind
+        if (frameCount >= nextRainAt) {
+            if (rainClouds.length === 0 && puddles.length < 3) rainClouds.push(new RainCloud());
+            nextRainAt = frameCount + 60 * (30 + Math.random() * 25);
+        }
+        // Thorn bushes creep in over time
+        if (frameCount >= nextThornAt) {
+            if (thorns.length < 3) {
+                let tx, ty, ok = false;
+                for (let a = 0; a < 20 && !ok; a++) {
+                    tx = playArea.minX + 60 + Math.random() * (playArea.maxX - playArea.minX - 120);
+                    ty = playArea.minY + 40 + Math.random() * (playArea.maxY - playArea.minY - 60);
+                    ok = !thorns.some(t => dist(tx, ty, t.x, t.y) < 160) &&
+                         !puddles.some(p => dist(tx, ty, p.x, p.y) < 120);
+                }
+                if (ok) thorns.push(new ThornBush(tx, ty));
+            }
+            nextThornAt = frameCount + 60 * (32 + Math.random() * 26);
+        }
+
+        // Lose: the whole flock is gone and nothing left to hatch
+        if (chickens.length === 0 && eggs.length === 0) {
+            gameState = 'lost';
+            showBanner('ALL YOUR CHICKENS ARE GONE', '#ff8080');
+        }
+        // Two minutes in: every hen lays at once, and what hatches isn't normal
+        if (!eggBoomDone && gameAge() >= EGG_BOOM_FRAME) {
+            eggBoomDone = true;
+            for (let c of chickens) {
+                let e = new Egg(c.x, c.y);
+                e.crazy = true;
+                eggs.push(e);
+                puff(c.x, c.y, 9, '#ffd6f5', 1.8);
+            }
+            if (chickens.length > 0) {
+                showBanner('THE FLOCK LAYS!', '#ffd700',
+                    'The whole flock is laying eggs! Something funny is going to hatch.');
+                sndSparkle();
+            }
+        }
+
+        // From here on, every egg laid hatches something unhinged
+        if (!crazyEraAnnounced && crazyEra()) {
+            crazyEraAnnounced = true;
+            showBanner('THE FLOCK HAS TURNED', '#ff6bcb',
+                'Now every egg hatches a crazy chicken!');
+            sndSparkle();
+        }
+
+        // Overgrown field? Here come the rabbits, all of them.
+        if (swarmCd > 0) swarmCd--;
+        if (swarmCd <= 0 && grasses.length >= GRASS_MAX) {
+            triggerRabbitSwarm();
+            swarmCd = 60 * 50;
+        }
+
+        // Flies home in on any pat that's had a few seconds to ripen
+        if (frameCount >= nextFlyAt) {
+            nextFlyAt = frameCount + 40 + Math.random() * 50;
+            if (flies.length < FLY_MAX) {
+                let pat = poops.find(p => p.active && p.age > 120 &&
+                    flies.filter(f => f.target === p && f.state !== 'leaving').length < FLY_PER_POOP);
+                if (pat) flies.push(new Fly(pat));
+            }
+        }
+        // Word gets around: once there's more than 3 clumps going, rabbits raid it
+        if (frameCount >= nextRabbitAt) {
+            if (grasses.length > RABBIT_THRESHOLD && rabbits.length < RABBIT_MAX) {
+                rabbits.push(new Rabbit());
+                nextRabbitAt = frameCount + 60 * (9 + Math.random() * 12);
+            } else {
+                nextRabbitAt = frameCount + 60; // check again shortly
+            }
+        }
+
+        // Nag about hungry birds now and then -- the main thing a kid needs to know
+        if (hungryNagCd > 0) hungryNagCd--;
+        if (hungryNagCd <= 0 && chickens.some(c => c.hunger > HUNGER_WARN)) {
+            hungryNagCd = 60 * 16;
+        }
+
+        } // end gameState === 'playing'
+
+        // Victory sequence: keep confetti going, and once the whole flock is
+        // safely in the coop, declare the win.
+        if (gameState === 'winning') {
+            if (frameCount % 4 === 0) spawnConfetti(3);
+            if (chickens.length === 0 || ++winHoldTimer > 60 * 8) finishWin();
+        } else if (gameState === 'won') {
+            if (frameCount % 10 === 0) spawnConfetti(4);
+        }
+        if (gameState !== 'playing') updateConfetti();
+
+        // Corn: refill the magazine on a timer, and if space is held keep
+        // throwing at the capped rate (a steady feed, never a flood).
+        if (cornThrowCd > 0) cornThrowCd--;
+        if (cornReady < CORN_MAG) {
+            if (--cornRefillCd <= 0) { cornReady++; cornRefillCd = CORN_REFILL_FRAMES; }
+        } else {
+            cornRefillCd = CORN_REFILL_FRAMES;
+        }
+        if (spaceHeld && gameState === 'playing') throwCorn();
+
+        if (boltCd > 0) boltCd--;
+        if (denyFlash > 0) denyFlash--;
+        if (boltDeny > 0) boltDeny--;
+        if (scorePop > 0) scorePop = Math.max(0, scorePop - 0.06);
+        if (flash > 0) flash = Math.max(0, flash - 0.08);
+
+        // Clean up arrays
+        foods = foods.filter(f => !f.consumed);
+        bags = bags.filter(b => b.active);
+        eggs = eggs.filter(e => e.active);
+        chickens = chickens.filter(c => !c.dead);
+        foxes = foxes.filter(f => f.active);
+        particles = particles.filter(p => p.active);
+        bears = bears.filter(b => b.active);
+        skyBirds = skyBirds.filter(b => b.active);
+        bolts = bolts.filter(b => b.active);
+        grasses = grasses.filter(g => !g.eaten);
+        rabbits = rabbits.filter(r => r.active);
+        poops = poops.filter(p => p.active);
+        flies = flies.filter(f => f.active);
+        wolves = wolves.filter(w => w.active);
+        gators = gators.filter(g => g.active);
+        farmers = farmers.filter(f => f.active);
+        puddles = puddles.filter(p => p.active);
+        thorns = thorns.filter(t => t.active);
+        rainClouds = rainClouds.filter(r => r.active);
+
+        // Update
+        foods.forEach(f => f.update());
+        bags.forEach(b => b.update());
+        eggs.forEach(e => e.update());
+        chickens.forEach(c => c.update());
+        horses.forEach(h => h.update());
+        cows.forEach(c => c.update());
+        foxes.forEach(f => f.update());
+        bears.forEach(b => b.update());
+        skyBirds.forEach(b => b.update());
+        bolts.forEach(b => b.update());
+        grasses.forEach(g => g.update());
+        rabbits.forEach(r => r.update());
+        poops.forEach(p => p.update());
+        flies.forEach(f => f.update());
+        wolves.forEach(w => w.update());
+        gators.forEach(g => g.update());
+        farmers.forEach(f => f.update());
+        puddles.forEach(p => p.update());
+        thorns.forEach(t => t.update());
+        rainClouds.forEach(r => r.update());
+        particles.forEach(p => p.update());
+
+        // Y-Sort rendering
+        let renderables = [...poops, ...grasses, ...foods, ...bags, ...eggs, ...flies, ...chickens, ...rabbits, ...horses, ...cows, ...foxes, ...bears,
+                           ...thorns, ...wolves, ...gators, ...farmers];
+        if (coop) renderables.push(coop);
+        renderables.sort((a, b) => a.y - b.y);
+        renderables.forEach(entity => entity.draw());
+
+        // Particles ride on top
+        particles.forEach(p => p.draw());
+
+        // Rain clouds float above the field
+        rainClouds.forEach(r => r.draw());
+        // Aiming crosshair for the corn
+        drawReticle();
+
+        // Confetti falls in front of everything
+        if (confetti.length) drawConfetti();
+
+        // Lightning over everything, then the flash of the strike
+        bolts.forEach(b => b.draw());
+        if (flash > 0) {
+            ctx.fillStyle = 'rgba(255,255,255,' + (flash * 0.55) + ')';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        drawTitle();
+        drawHUD();
+        if (!audioStarted) drawStartGate();
+
+        // Blit the buffer up to full size with no smoothing => crunchy pixels
+        screenCtx.setTransform(1, 0, 0, 1, 0, 0);
+        screenCtx.imageSmoothingEnabled = false;
+        screenCtx.clearRect(0, 0, canvas.width, canvas.height);
+        screenCtx.drawImage(buffer, 0, 0, canvas.width, canvas.height);
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    init();
+</script>
+
+</body>
+</html>
