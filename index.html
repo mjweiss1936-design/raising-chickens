@@ -198,9 +198,11 @@
     // they're gone (e.g. when the bear leads them all away).
     const MUSIC_CALM  = 'Pasture_Under_the_Rising_Sun.mp3';
     const MUSIC_CRAZY = 'crazy-chickens.mp3';
+    const MUSIC_WIN   = 'victory.mp3';
     let musicOn = false;              // starts muted, on purpose
-    let musicCalmEl = null, musicCrazyEl = null;
+    let musicCalmEl = null, musicCrazyEl = null, victoryEl = null;
     let musicPlayingEl = null;
+    let victoryPlaying = false;
 
     function initMusic() {
         if (musicCalmEl) return;
@@ -210,6 +212,37 @@
         musicCrazyEl = new Audio(MUSIC_CRAZY);
         musicCrazyEl.loop = true; musicCrazyEl.volume = 0.5;
         musicCrazyEl.preload = 'none';
+        // The victory track is a reward sting, so it follows the MUTE key
+        // rather than the music toggle -- otherwise almost nobody would
+        // ever hear it, since music starts off.
+        victoryEl = new Audio(MUSIC_WIN);
+        victoryEl.loop = false; victoryEl.volume = 0.6;
+        victoryEl.preload = 'none';
+        victoryEl.addEventListener('ended', () => {
+            stopVictory();              // make sure it's fully released
+            updateMusic();              // let the background music back in
+        });
+    }
+
+    function playVictory() {
+        initMusic();
+        if (!soundOn) return;           // muted means muted
+        // hush the background track so they don't play over each other
+        for (let el of [musicCalmEl, musicCrazyEl]) if (el && !el.paused) el.pause();
+        musicPlayingEl = null;
+        victoryPlaying = true;
+        victoryEl.preload = 'auto';
+        try { victoryEl.currentTime = 0; } catch (e) {}
+        let p = victoryEl.play();
+        if (p && p.catch) p.catch(() => {});
+    }
+
+    function stopVictory() {
+        victoryPlaying = false;
+        if (victoryEl && !victoryEl.paused) {
+            victoryEl.pause();
+            try { victoryEl.currentTime = 0; } catch (e) {}
+        }
     }
 
     // Are there crazy chickens loose right now?
@@ -220,6 +253,12 @@
 
     function updateMusic() {
         if (!musicCalmEl) return;
+        // the victory track owns the speakers while it's playing
+        if (victoryPlaying) {
+            for (let el of [musicCalmEl, musicCrazyEl]) if (!el.paused) el.pause();
+            musicPlayingEl = null;
+            return;
+        }
         let want = musicOn && soundOn;
         let target = !want ? null : (crazyOnTheLoose() ? musicCrazyEl : musicCalmEl);
         // stop anything that shouldn't be playing
@@ -3254,14 +3293,14 @@
         rabbits.length = 0;
         for (let c of chickens) { c.state = 'toCoop'; c.releaseFood(); }
         showBanner('YOU DID IT!', '#ffd23b');
-        sndFanfare();
+        playVictory();          // the win track takes over from here
         spawnConfetti(120);
     }
 
     function finishWin() {
         gameState = 'won';
         showBanner('YOU WIN!', '#ffd23b');
-        sndFanfare();
+        // no sting here -- the victory track is already playing
     }
 
     // Wipe the board and start a brand new game.
@@ -3282,6 +3321,8 @@
         banner = null;
         eggBoomDone = false; crazyEraAnnounced = false;
         cornReady = CORN_MAG; cornRefillCd = CORN_REFILL_FRAMES; cornThrowCd = 0;
+        stopVictory();          // new game -- back to the normal soundtrack
+        updateMusic();
         gameState = 'playing';
         // reset the timed events relative to now
         nextBearAt = frameCount + 60 * (25 + Math.random() * 45);
@@ -3857,6 +3898,7 @@
             e.preventDefault();
             soundOn = !soundOn;
             if (masterGain) masterGain.gain.value = soundOn ? 0.9 : 0;
+            if (!soundOn) stopVictory();
             updateMusic();          // muting everything stops the music too
             return;
         }
