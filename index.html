@@ -120,6 +120,17 @@
     const BOLT_BTN  = { x: 20, y: 112, w: 206, h: 62 };
     const MUSIC_BTN = { x: 878, y: 186, w: 206, h: 56 };
     const DIFF_BTN  = { x: 660, y: 186, w: 200, h: 56 };
+    // The opening difficulty picker
+    let gameStarted = false;
+    const START_EASY_BTN = { x: 350, y: 310, w: 260, h: 140 };
+    const START_HARD_BTN = { x: 670, y: 310, w: 260, h: 140 };
+    function beginGame(easy) {
+        easyMode = easy;
+        applyDifficulty();
+        initAudio();          // this counts as the user gesture for sound
+        gameStarted = true;
+        restartGame();
+    }
     function inBtn(b, px, py) {
         return px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h;
     }
@@ -3659,22 +3670,67 @@
     }
 
     // Audio can't start until the player touches something, so ask them to.
+    // Pick your difficulty before the first game starts.
     function drawStartGate() {
-        ctx.save();
-        ctx.fillStyle = 'rgba(0,0,0,0.55)';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.textAlign = 'center';
         let cx = canvas.width / 2, cy = canvas.height / 2;
-        let pulse = 1 + Math.sin(frameCount * 0.06) * 0.04;
-        ctx.translate(cx, cy); ctx.scale(pulse, pulse);
-        ctx.font = 'bold 44px "Courier New", monospace';
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.62)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 46px "Courier New", monospace';
         ctx.fillStyle = '#000000';
-        ctx.fillText('CLICK TO START', 3, 3);
+        ctx.fillText('FARM YARD CHAOS', cx + 3, cy - 117);
         ctx.fillStyle = '#FFD700';
-        ctx.fillText('CLICK TO START', 0, 0);
-        ctx.font = 'bold 20px "Courier New", monospace';
+        ctx.fillText('FARM YARD CHAOS', cx, cy - 120);
+        ctx.font = 'bold 22px "Courier New", monospace';
         ctx.fillStyle = '#ffffff';
-        ctx.fillText('( click the grass to drop corn )', 0, 42);
+        ctx.fillText('Pick how hard you want it', cx, cy - 78);
+
+        // the two choices
+        let opts = [
+            { b: START_EASY_BTN, on: true,  title: 'EASY',
+              sub: ['for little farmers', 'nothing can trap you'], chicks: 3,
+              face: '#3f9c55', edge: '#8aff6b', text: '#eaffe0' },
+            { b: START_HARD_BTN, on: false, title: 'HARD',
+              sub: ['foxes in packs,', 'mud and thorns kill'], chicks: 1,
+              face: '#a83c34', edge: '#ff9090', text: '#ffe0e0' }
+        ];
+        for (let o of opts) {
+            let b = o.b, hover = inBtn(b, rawMouseX, rawMouseY);
+            let pulse = hover ? 1 + Math.sin(frameCount * 0.18) * 0.03 : 1;
+            ctx.save();
+            ctx.translate(b.x + b.w / 2, b.y + b.h / 2);
+            ctx.scale(pulse, pulse);
+            ctx.translate(-(b.x + b.w / 2), -(b.y + b.h / 2));
+            ctx.fillStyle = o.face;
+            ctx.fillRect(b.x, b.y, b.w, b.h);
+            ctx.strokeStyle = hover ? '#ffffff' : o.edge;
+            ctx.lineWidth = hover ? 4 : 3;
+            ctx.strokeRect(b.x, b.y, b.w, b.h);
+            // chick row: more chicks = gentler
+            for (let i = 0; i < o.chicks; i++) {
+                let px = b.x + b.w / 2 - (o.chicks - 1) * 11 + i * 22, py = b.y + 34;
+                ctx.fillStyle = '#ffe9a8';
+                ctx.beginPath();
+                ctx.moveTo(px + 9, py); ctx.lineTo(px - 7, py - 7); ctx.lineTo(px - 6, py + 6);
+                ctx.closePath(); ctx.fill();
+            }
+            ctx.textAlign = 'center';
+            ctx.font = 'bold 34px "Courier New", monospace';
+            ctx.fillStyle = o.text;
+            ctx.fillText(o.title, b.x + b.w / 2, b.y + 78);
+            ctx.font = 'bold 13px "Courier New", monospace';
+            ctx.fillStyle = 'rgba(255,255,255,0.85)';
+            ctx.fillText(o.sub[0], b.x + b.w / 2, b.y + 102);
+            ctx.fillText(o.sub[1], b.x + b.w / 2, b.y + 119);
+            ctx.restore();
+        }
+
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 15px "Courier New", monospace';
+        ctx.fillStyle = 'rgba(255,255,255,0.8)';
+        ctx.fillText('you can switch any time with the button or the E key', cx, cy + 150);
         ctx.restore();
         ctx.textAlign = 'left';
     }
@@ -3995,10 +4051,16 @@
     }
 
     // Browsers won't let audio start until the player interacts
-    window.addEventListener('pointerdown', initAudio);
-    window.addEventListener('keydown', initAudio);
+    // NB: audio deliberately starts when a difficulty is chosen, not on any
+    // stray click -- otherwise the picker would dismiss itself.
 
     window.addEventListener('keydown', (e) => {
+        if (!gameStarted) {                       // keyboard can pick too
+            if (e.code === 'KeyH') beginGame(false);
+            else if (e.code === 'KeyE' || e.code === 'Space' || e.code === 'Enter') beginGame(true);
+            e.preventDefault();
+            return;
+        }
         if (e.code === 'KeyM') {
             e.preventDefault();
             soundOn = !soundOn;
@@ -4050,7 +4112,7 @@
         rawMouseX = p.x; rawMouseY = p.y;
         mouseX = clampX(p.x); mouseY = clampY(p.y);
         // don't aim corn while hovering the music button
-        mouseIn = p.y > horizonY - 10 && !inAnyBtn(p.x, p.y);
+        mouseIn = gameStarted && p.y > horizonY - 10 && !inAnyBtn(p.x, p.y);
     });
     canvas.addEventListener('mouseleave', () => { mouseIn = false; });
     canvas.addEventListener('mousedown', (e) => {
@@ -4058,6 +4120,11 @@
         if (e.button !== 0) return;
         e.preventDefault();
         let p = canvasPos(e);
+        if (!gameStarted) {                       // choosing difficulty
+            if (inBtn(START_EASY_BTN, p.x, p.y)) beginGame(true);
+            else if (inBtn(START_HARD_BTN, p.x, p.y)) beginGame(false);
+            return;
+        }
         // buttons take priority over everything else
         if (inBoltBtn(p.x, p.y)) { pressBolt(); return; }
         if (inMusicBtn(p.x, p.y)) { toggleMusic(); return; }
@@ -4076,6 +4143,11 @@
         let r = canvas.getBoundingClientRect();
         let rx = (t.clientX - r.left) * (canvas.width / r.width);
         let ry = (t.clientY - r.top) * (canvas.height / r.height);
+        if (!gameStarted) {                       // choosing difficulty
+            if (inBtn(START_EASY_BTN, rx, ry)) beginGame(true);
+            else if (inBtn(START_HARD_BTN, rx, ry)) beginGame(false);
+            return;
+        }
         if (inBoltBtn(rx, ry)) { pressBolt(); return; }
         if (inMusicBtn(rx, ry)) { toggleMusic(); return; }
         if (inDiffBtn(rx, ry)) { toggleDifficulty(); return; }
@@ -4354,7 +4426,7 @@
         drawBoltButton();
         drawMusicButton();
         drawDiffButton();
-        if (!audioStarted) drawStartGate();
+        if (!gameStarted) drawStartGate();
 
         // Blit the buffer up to full size with no smoothing => crunchy pixels
         screenCtx.setTransform(1, 0, 0, 1, 0, 0);
