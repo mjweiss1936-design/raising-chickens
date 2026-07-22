@@ -12,8 +12,9 @@ to the fox, the wolf, the alligator, the angry farmer, the mud or the thorns.
 - Hens are not clever. If you stop feeding them they wander into trouble on their own.
 - **P** calls down lightning and scares off every fox on the field (long recharge).
 - **F** fullscreen, **M** mute, **N** music on/off (starts off).
+- **E** (or the on-screen button) switches between EASY and HARD. Starts on EASY.
 
-Goal: get 11 plump chickens at once and they all march into the coop.
+Goal: get 6 plump chickens at once (7 on hard) and they all march into the coop.
 
 ## Files
 

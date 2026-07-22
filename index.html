@@ -119,12 +119,14 @@
     // tucked below the goal bar and clear of the right-hand stats.
     const BOLT_BTN  = { x: 20, y: 112, w: 206, h: 62 };
     const MUSIC_BTN = { x: 878, y: 186, w: 206, h: 56 };
+    const DIFF_BTN  = { x: 660, y: 186, w: 200, h: 56 };
     function inBtn(b, px, py) {
         return px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h;
     }
     function inMusicBtn(px, py) { return inBtn(MUSIC_BTN, px, py); }
     function inBoltBtn(px, py) { return inBtn(BOLT_BTN, px, py); }
-    function inAnyBtn(px, py) { return inMusicBtn(px, py) || inBoltBtn(px, py); }
+    function inDiffBtn(px, py) { return inBtn(DIFF_BTN, px, py); }
+    function inAnyBtn(px, py) { return inMusicBtn(px, py) || inBoltBtn(px, py) || inDiffBtn(px, py); }
 
     // Tapping the bolt button does exactly what P does
     function pressBolt() {
@@ -587,10 +589,52 @@
     // unless you keep corn down somewhere safe to hold their attention.
     let HEN_SMARTS = 0.35;            // chance she thinks twice about a bad spot
     let HEN_PREDATOR_SENSE = 0.55;    // fraction of a predator's scare range she notices
+
+    // ============================================================
+    //  DIFFICULTY -- EASY is the default so a small child can enjoy it.
+    //  Press E (or the on-screen button) for the harder game.
+    // ============================================================
+    let easyMode = true;
+    let STUCK_IS_FATAL = true;        // do mud/thorns kill, or just trap?
+    let FOX_WAVE = [2, 3, 4];         // pack size at low / mid / high progress
+    let HAZARD_GAP_MIN = 38, HAZARD_GAP_RAND = 24;   // seconds between hazards
+
+    function applyDifficulty() {
+        if (easyMode) {
+            // Hens are sensible, mud only traps them briefly, foxes come alone
+            // and the scary visitors are rare. Very hard to actually lose.
+            HEN_SMARTS = 0.95;
+            HEN_PREDATOR_SENSE = 1.0;
+            WIN_PLUMP = 6;
+            STUCK_IS_FATAL = false;
+            FOX_WAVE = [1, 1, 2];
+            HAZARD_GAP_MIN = 70; HAZARD_GAP_RAND = 40;
+        } else {
+            HEN_SMARTS = 0.35;
+            HEN_PREDATOR_SENSE = 0.55;
+            WIN_PLUMP = 7;
+            STUCK_IS_FATAL = true;
+            FOX_WAVE = [2, 3, 4];
+            HAZARD_GAP_MIN = 38; HAZARD_GAP_RAND = 24;
+        }
+    }
+    function toggleDifficulty() {
+        easyMode = !easyMode;
+        applyDifficulty();
+        restartGame();      // fresh start under the new rules...
+        showBanner(easyMode ? 'EASY MODE' : 'HARD MODE', easyMode ? '#8aff6b' : '#ff8080');
+    }                       // ...banner after, since restart clears it
+    applyDifficulty();
     let coop = null;                  // the henhouse, built when you win
     let confetti = [];
     let winHoldTimer = 0;
     let chickensHoused = 0;
+    // When a win/lose screen appeared. A click already on its way must NOT
+    // dismiss it -- otherwise the player never sees it and the score appears
+    // to reset itself for no reason.
+    let endScreenAt = -9999;
+    const END_SCREEN_LOCK = 100;      // ~1.7s before a tap can restart
+    function endScreenReady() { return frameCount - endScreenAt > END_SCREEN_LOCK; }
 
     function plumpCount() {
         let n = 0;
@@ -1086,12 +1130,30 @@
                         this.stuckKind === 'thorn' ? '#3d5c33' : '#5b4a33', 0.8);
                 }
                 if (this.stuck <= 0) {
-                    this.dead = true;
-                    chickensLost++;
-                    stuckLosses++;
-                    featherBurst(this.x, this.y);
-                    puff(this.x, this.y, 7, this.stuckKind === 'thorn' ? '#3d5c33' : '#5b4a33', 1.4);
-                    sndYip();
+                    if (STUCK_IS_FATAL) {
+                        this.dead = true;
+                        chickensLost++;
+                        stuckLosses++;
+                        featherBurst(this.x, this.y);
+                        puff(this.x, this.y, 7, this.stuckKind === 'thorn' ? '#3d5c33' : '#5b4a33', 1.4);
+                        sndYip();
+                    } else {
+                        // Easy mode: she wriggles out and hops clear instead of
+                        // dying. Shove her past the edge so she can't re-stick.
+                        stuckLosses++;
+                        let z = this.stuckZone;
+                        if (z) {
+                            let a = Math.atan2(this.y - z.y, this.x - z.x);
+                            if (!isFinite(a) || (this.x === z.x && this.y === z.y)) a = Math.random() * Math.PI * 2;
+                            this.x = clampX(z.x + Math.cos(a) * (z.r + 22));
+                            this.y = clampY(z.y + Math.sin(a) * (z.r * 0.6 + 14));
+                        }
+                        this.stuckZone = null;
+                        this.releaseFood();
+                        this.state = 'wander'; this.timer = 10;
+                        this.flutter(this.x - 20, this.y, false);   // little scramble
+                        puff(this.x, this.y, 5, '#d8e2c4', 1.1);
+                    }
                 }
                 return;
             }
@@ -1197,8 +1259,17 @@
                     nearestThreatDist = d; threatX = z.x; threatY = z.y;
                 }
             }
-            // Mud and thorns? She doesn't give them a second thought and will
-            // wander straight in. Keep corn down somewhere safe to hold her.
+            // Mud and thorns? In the hard game she doesn't give them a second
+            // thought and will wander straight in -- keep corn down somewhere
+            // safe to hold her. In easy mode she's sensible and walks around,
+            // unless the corn itself is sitting in the patch.
+            if (easyMode) {
+                for (let z of stickZones()) {
+                    if (chasingFood && dist(lureX, lureY, z.x, z.y) < z.r + 48) continue;
+                    let d = dist(this.x, this.y, z.x, z.y);
+                    if (d < z.r + 40 && d < nearestThreatDist) { nearestThreatDist = d; threatX = z.x; threatY = z.y; }
+                }
+            }
             // Hens hate getting rained on -- they clear off before the puddle forms
             for (let rc of rainClouds) {
                 if (rc.state !== 'rain') continue;
@@ -1306,9 +1377,10 @@
                 }
             }
 
-            // NB: no avoidHazards() here on purpose -- a wandering hen is dumb
-            // enough to walk into the mud. It only applies when she's panicking,
-            // where the player has no say.
+            // In the hard game there's deliberately no avoidHazards() here -- a
+            // wandering hen is dumb enough to walk into the mud. In easy mode
+            // she physically shoulders away from it.
+            if (easyMode) this.avoidHazards();
             this.walkCycle = isMoving ? this.walkCycle + 0.2 * currentSpeed : 0;
         }
 
@@ -3299,6 +3371,7 @@
 
     function finishWin() {
         gameState = 'won';
+        endScreenAt = frameCount;
         showBanner('YOU WIN!', '#ffd23b');
         // no sting here -- the victory track is already playing
     }
@@ -3508,6 +3581,34 @@
             ctx.fillText(Math.ceil(boltCd / 60) + 's', b.x + 60, b.y + 49);
         }
         ctx.textAlign = 'left';
+        ctx.restore();
+    }
+
+    // EASY / HARD switch, so a small child and a big one can both play.
+    function drawDiffButton() {
+        let b = DIFF_BTN;
+        let hover = inDiffBtn(rawMouseX, rawMouseY);
+        ctx.save();
+        ctx.fillStyle = easyMode ? 'rgba(40,110,55,0.85)' : 'rgba(120,45,40,0.85)';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        ctx.strokeStyle = hover ? '#ffffff' : (easyMode ? '#8aff6b' : '#ff9090');
+        ctx.lineWidth = 2;
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+
+        // a row of little chicks: more = easier
+        let n = easyMode ? 3 : 1;
+        for (let i = 0; i < n; i++) {
+            let cx2 = b.x + 22 + i * 15, cy2 = b.y + 22;
+            ctx.fillStyle = easyMode ? '#ffe9a8' : '#ffd0d0';
+            ctx.beginPath(); ctx.moveTo(cx2 + 6, cy2); ctx.lineTo(cx2 - 5, cy2 - 5); ctx.lineTo(cx2 - 4, cy2 + 4);
+            ctx.closePath(); ctx.fill();
+        }
+        ctx.font = 'bold 17px "Courier New", monospace';
+        ctx.fillStyle = easyMode ? '#eaffe0' : '#ffe0e0';
+        ctx.fillText(easyMode ? 'EASY' : 'HARD', b.x + 78, b.y + 27);
+        ctx.font = 'bold 10px "Courier New", monospace';
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+        ctx.fillText(easyMode ? 'tap for harder  (E)' : 'tap for easier  (E)', b.x + 16, b.y + 46);
         ctx.restore();
     }
 
@@ -3824,12 +3925,14 @@
             ctx.font = 'bold 30px "Courier New", monospace';
             ctx.fillStyle = '#FFD700';
             ctx.fillText('SCORE: ' + score, cx, cy + 48);
-            let p = 0.6 + 0.4 * Math.sin(frameCount * 0.08);
-            ctx.globalAlpha = p;
-            ctx.font = 'bold 22px "Courier New", monospace';
-            ctx.fillStyle = '#ffd23b';
-            ctx.fillText('press SPACE or CLICK to try again', cx, cy + 96);
-            ctx.globalAlpha = 1;
+            if (endScreenReady()) {
+                let p = 0.6 + 0.4 * Math.sin(frameCount * 0.08);
+                ctx.globalAlpha = p;
+                ctx.font = 'bold 22px "Courier New", monospace';
+                ctx.fillStyle = '#ffd23b';
+                ctx.fillText('press SPACE or CLICK to try again', cx, cy + 96);
+                ctx.globalAlpha = 1;
+            }
             ctx.textAlign = 'left';
             ctx.restore();
         }
@@ -3856,13 +3959,15 @@
             ctx.fillStyle = '#8aff6b';
             ctx.fillText('FINAL SCORE: ' + score, cx, cy + 56);
 
-            // gentle pulsing "play again" prompt
-            let p = 0.6 + 0.4 * Math.sin(frameCount * 0.08);
-            ctx.globalAlpha = p;
-            ctx.font = 'bold 22px "Courier New", monospace';
-            ctx.fillStyle = '#ffd23b';
-            ctx.fillText('press SPACE to play again', cx, cy + 104);
-            ctx.globalAlpha = 1;
+            // gentle pulsing "play again" prompt, once tapping actually works
+            if (endScreenReady()) {
+                let p = 0.6 + 0.4 * Math.sin(frameCount * 0.08);
+                ctx.globalAlpha = p;
+                ctx.font = 'bold 22px "Courier New", monospace';
+                ctx.fillStyle = '#ffd23b';
+                ctx.fillText('press SPACE or CLICK to play again', cx, cy + 104);
+                ctx.globalAlpha = 1;
+            }
             ctx.textAlign = 'left';
         }
     }
@@ -3902,6 +4007,11 @@
             updateMusic();          // muting everything stops the music too
             return;
         }
+        if (e.code === 'KeyE') {    // easy / hard
+            e.preventDefault();
+            toggleDifficulty();
+            return;
+        }
         if (e.code === 'KeyN') {    // music on/off (starts off)
             e.preventDefault();
             toggleMusic();
@@ -3912,7 +4022,7 @@
             // Guard key-repeat FIRST -- otherwise holding space on the win
             // screen would restart the game dozens of times a second.
             if (e.repeat) return;
-            if (gameState === 'won' || gameState === 'lost') { restartGame(); return; }
+            if (gameState === 'won' || gameState === 'lost') { if (endScreenReady()) restartGame(); return; }
             spaceHeld = true;       // hold to keep feeding at the capped rate
             throwCorn();            // immediate throw for a responsive first tap
         } else if (e.code === 'KeyP') {
@@ -3951,7 +4061,8 @@
         // buttons take priority over everything else
         if (inBoltBtn(p.x, p.y)) { pressBolt(); return; }
         if (inMusicBtn(p.x, p.y)) { toggleMusic(); return; }
-        if (gameState === 'won' || gameState === 'lost') { restartGame(); return; }
+        if (inDiffBtn(p.x, p.y)) { toggleDifficulty(); return; }
+        if (gameState === 'won' || gameState === 'lost') { if (endScreenReady()) restartGame(); return; }
         rawMouseX = p.x; rawMouseY = p.y;
         mouseX = clampX(p.x); mouseY = clampY(p.y); mouseIn = true;
         throwCorn(mouseX, mouseY);
@@ -3967,8 +4078,9 @@
         let ry = (t.clientY - r.top) * (canvas.height / r.height);
         if (inBoltBtn(rx, ry)) { pressBolt(); return; }
         if (inMusicBtn(rx, ry)) { toggleMusic(); return; }
+        if (inDiffBtn(rx, ry)) { toggleDifficulty(); return; }
         let x = clampX(rx), y = clampY(ry);
-        if (gameState === 'won' || gameState === 'lost') { restartGame(); return; }
+        if (gameState === 'won' || gameState === 'lost') { if (endScreenReady()) restartGame(); return; }
         // show the aiming reticle where they tapped, so the danger warning
         // is visible on touch devices too (no hover to rely on)
         rawMouseX = rx; rawMouseY = ry;
@@ -4021,7 +4133,7 @@
         if (frameCount % FOX_SPAWN_FRAMES === 0) {
             // Foxes attack in packs, and from both sides at once
             let prog = plumpCount() / WIN_PLUMP;
-            let n = prog >= 0.7 ? 4 : (prog >= 0.4 ? 3 : 2);
+            let n = prog >= 0.7 ? FOX_WAVE[2] : (prog >= 0.4 ? FOX_WAVE[1] : FOX_WAVE[0]);
             for (let i = 0; i < n; i++) foxes.push(new Fox(i % 2 === 0 ? -1 : 1));
             sndYip();
             if (n > 1) showBanner(n + ' FOXES!', '#ff8080');
@@ -4043,7 +4155,7 @@
         if (frameCount >= nextHazardAt) {
             if (wolves.length + gators.length + farmers.length === 0) {
                 spawnRoamingHazard();
-                nextHazardAt = frameCount + 60 * (38 + Math.random() * 24);
+                nextHazardAt = frameCount + 60 * (HAZARD_GAP_MIN + Math.random() * HAZARD_GAP_RAND);
             } else {
                 nextHazardAt = frameCount + 60 * 5; // busy -- check back shortly
             }
@@ -4073,6 +4185,7 @@
         // Lose: the whole flock is gone and nothing left to hatch
         if (chickens.length === 0 && eggs.length === 0) {
             gameState = 'lost';
+            endScreenAt = frameCount;
             showBanner('ALL YOUR CHICKENS ARE GONE', '#ff8080');
         }
         // Two minutes in: every hen lays at once, and what hatches isn't normal
@@ -4240,6 +4353,7 @@
         drawHUD();
         drawBoltButton();
         drawMusicButton();
+        drawDiffButton();
         if (!audioStarted) drawStartGate();
 
         // Blit the buffer up to full size with no smoothing => crunchy pixels
