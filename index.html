@@ -676,6 +676,24 @@
         }
         return n;
     }
+
+    // Progress toward the goal only ever goes UP. Watching the bar slip back
+    // is miserable when you are six, so two things protect it: every plump hen
+    // you lose is banked and keeps counting, and the number itself is a
+    // high-water mark that can never fall. You still have to feed the flock to
+    // push it higher -- a hungry hen slims below plump and stops adding to it
+    // -- but nothing that happens to a bird can ever take a point away.
+    let plumpBanked = 0;    // plump hens lost to a predator, a bolt, or the bear
+    let plumpPeak = 0;      // and the best total ever reached
+    function bankIfPlump(c) {
+        if (c && !c.dead && c.fatness >= PLUMP_THRESHOLD &&
+            c.state !== 'exodus' && c.state !== 'toCoop') plumpBanked++;
+    }
+    function goalProgress() {
+        let now = plumpCount() + plumpBanked;
+        if (now > plumpPeak) plumpPeak = now;
+        return plumpPeak;
+    }
     function addScore(n) {
         if (gameState !== 'playing') return;
         score += n;
@@ -1047,6 +1065,7 @@
 
         // Off with the bear, never to return
         startExodus(dirX) {
+            bankIfPlump(this);          // off with the bear, but she still counts
             this.state = 'exodus';
             this.z = Math.max(this.z, 2);
             this.vz = 2.2 + Math.random() * 1.2;
@@ -2954,6 +2973,7 @@
 
     function eatChicken(c, byWhat) {
         if (!c || c.dead) return false;
+        bankIfPlump(c);
         c.dead = true;
         chickensLost++;
         featherBurst(c.x, c.y);
@@ -3213,6 +3233,7 @@
 
     // ZAP. Something was standing right there.
     function vaporise(c) {
+        bankIfPlump(c);
         c.dead = true;
         chickensVaporised++;
         releaseJob(c);
@@ -5139,6 +5160,7 @@
         nextFarmerAt = frameCount + 60 * 44;
         nextStampedeAt = frameCount + 60 * 50;
         bigSackAnnounced = false;
+        plumpBanked = 0; plumpPeak = 0;
         score = 0; scorePop = 0;
         chickensLost = 0; foxesZapped = 0; garrisonRouts = 0; chickensStarved = 0; chickensVaporised = 0;
         grassStolen = 0; cowMeals = 0; crazyDeparted = 0;
@@ -5433,7 +5455,7 @@
         ctx.restore();
 
         // GOAL bar -- plump chickens toward the win
-        let have = Math.min(WIN_PLUMP, plumpCount());
+        let have = Math.min(WIN_PLUMP, goalProgress());
         let bw = 300, bh = 22, bx = cx - bw / 2, by = 92;
         ctx.font = 'bold 13px "Courier New", monospace';
         ctx.fillStyle = '#ffffff';
@@ -5524,7 +5546,8 @@
         let lines = [
             ['CHICKENS ' + chickens.length + (crazyN ? '  (' + crazyN + ' CRAZY)' : ''),
                 crazyN ? '#ff6bcb' : '#FFD700'],
-            ['PLUMP ' + plumpCount() + ' / ' + WIN_PLUMP, '#8aff6b'],
+            ['PLUMP ' + goalProgress() + ' / ' + WIN_PLUMP +
+                (plumpBanked ? '  (' + plumpBanked + ' remembered)' : ''), '#8aff6b'],
             ['CORN ' + left + '/' + CORN_MAG + '  (bags of ' + bagKernels() + ')',
                 left > 0 ? '#FFD700' : '#ff8080'],
             ['EATEN ' + chickensLost + '   ZAPPED BY YOU ' + chickensVaporised,
@@ -5787,7 +5810,7 @@
         if (gameState === 'playing') {
 
         // You win the moment you have enough plump chickens
-        if (plumpCount() >= WIN_PLUMP) startWin();
+        if (goalProgress() >= WIN_PLUMP) startWin();
 
         // Spawn Mechanics
         if (frameCount % EGG_SPAWN_FRAMES === 0) {

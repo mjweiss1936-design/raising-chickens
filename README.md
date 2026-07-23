@@ -41,6 +41,18 @@ needs more chickens than the last one:
 | 244 | an aeroplane, which they fly around the sky trailing a banner, for no reason |
 | 268+ | **another house**, and then another, and another, for as long as there is room in the yard |
 
+## The goal bar only ever goes up
+
+Losing a chicken never costs you progress. Every plump hen taken by a
+predator, zapped by your own lightning, or flown off with the bear is
+remembered and keeps counting toward the goal -- and the number itself is a
+high-water mark, so nothing can ever take a point off it. The stats show how
+many are being remembered.
+
+You still have to keep feeding the flock to push it higher; a hen who goes
+hungry slims back down and stops adding to it. But the bar never slides
+backwards, which is unbearable to watch when you're six.
+
 ## Babies
 
 Every minute or so a baby horse or a baby cow simply turns up standing next
