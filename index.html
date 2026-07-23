@@ -85,23 +85,53 @@
     let chickens = [];
     let horses = [];
     let cows = [];
-    let foxes = [];
     let eggs = [];
     let foods = [];
     let bags = [];
     let particles = [];
-    let bears = [];
     let skyBirds = [];
     let bolts = [];
     let grasses = [];
 
-    // --- Hazards: these make WHERE you drop the corn the whole game ---
-    let wolves = [];       // hangs about and eats any hen that feeds too close
-    let gators = [];       // lurks at the edge and snaps
-    let farmers = [];      // angry, shoos the flock away
-    let rainClouds = [];   // drops a puddle then drifts off
-    let nextHazardAt = 60 * 25;
-    let nextRainAt = 60 * 34;
+    // --- PREDATORS ---
+    // Fox, wolf, alligator and bear are all the same animal underneath: they
+    // run in, try to grab a hen, and a bolt of lightning sends them packing.
+    // Only the artwork and the numbers are different.
+    let predators = [];
+    let nextPredAt = 60 * 26;
+    const PRED_MAX = 6;
+
+    // The farmer turns up shouting, then loses his nerve completely. Harmless.
+    let farmers = [];
+    let nextFarmerAt = 60 * 44;
+
+    // --- SPATIAL GRID ---
+    // With hundreds of chickens on the field, checking every bird against
+    // every other bird is hopeless. Bucket everything into cells and only
+    // ever look at the nine cells around you.
+    const HEN_CELL = 56, CORN_CELL = 150;
+    const henGrid = new Map(), cornGrid = new Map();
+    function gridBuild(map, list, cell) {
+        map.clear();
+        for (let i = 0; i < list.length; i++) {
+            let o = list[i];
+            let k = (((o.x / cell) | 0) * 1000) + ((o.y / cell) | 0);
+            let b = map.get(k);
+            if (b) b.push(o); else map.set(k, [o]);
+        }
+    }
+    function gridNear(map, cell, x, y, out) {
+        out.length = 0;
+        let cx = (x / cell) | 0, cy = (y / cell) | 0;
+        for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
+            let b = map.get((cx + i) * 1000 + (cy + j));
+            if (b) for (let k = 0; k < b.length; k++) out.push(b[k]);
+        }
+        return out;
+    }
+    const _nearHens = [], _nearCorn = [], _nearBall = [];
+    function nearHens(x, y) { return gridNear(henGrid, HEN_CELL, x, y, _nearHens); }
+    function nearCorn(x, y) { return gridNear(cornGrid, CORN_CELL, x, y, _nearCorn); }
 
     // Mouse aiming -- corn is placed where you click
     // Raw (unclamped) pointer, for on-screen buttons up in the sky area
@@ -160,6 +190,9 @@
     // A few minutes in, nothing normal hatches any more. Measured from the
     // start of the current game so a replay begins fresh, not mid-chaos.
     const CRAZY_ERA_FRAME = 180 * 60;
+    // ...but only a sprinkling of them, or the bear would carry off the whole
+    // farm every time it wandered through and the flock could never grow.
+    const CRAZY_HATCH = 0.14;
     let crazyEraAnnounced = false;
     function gameAge() { return frameCount - gameStartFrame; }
     function crazyEra() { return gameAge() >= CRAZY_ERA_FRAME; }
@@ -168,8 +201,10 @@
     const HORSE_PLUMP_PER_KERNEL = 0.002; // 500 kernels from lean to boulder
 
     // Feed a hen enough and she gets fat; fat hens lay whole clutches
-    let FAT_LAY_THRESHOLD = 1.8;
-    const CHICKEN_CAP = 30;
+    // Lay well before the fatness cap, and only lose a little of it, so a
+    // hen stays plump through a clutch. That is what makes the flock explode.
+    let FAT_LAY_THRESHOLD = 1.45;
+    const CHICKEN_CAP = 400;
 
     // Forget to feed them and they starve
     const HUNGER_WARN = 60 * 55;    // starts looking rough
@@ -179,6 +214,8 @@
 
     // Rabbit swarm: when the field is overgrown, they strip the lot
     let swarmCd = 0;
+    // ...and every so often a great many rabbits simply run across the farm
+    let nextStampedeAt = 60 * 50;
 
     // ============================================================
     //  SOUND, MUSIC AND SPEECH
@@ -515,19 +552,25 @@
     let frameCount = 0;
     let gameStartFrame = 0;   // reset on replay so timed events restart too
     let chickensLost = 0;
+    let chickensVaporised = 0;
     let foxesZapped = 0;
     let flash = 0;          // white screen flash from a lightning strike
     let nextBearAt = 60 * (25 + Math.random() * 45);
     let nextFlockAt = 60 * (5 + Math.random() * 8);
-    const EGG_SPAWN_FRAMES = 60 * 60; // 60 seconds at 60fps
-    const FOX_SPAWN_FRAMES = 38 * 60; // 38s -- eased, the new hazards add pressure
+    const EGG_SPAWN_FRAMES = 60 * 30; // a spare egg turns up every 30s
 
     // Corn "magazine": you hold a few handfuls of corn. Each throw spends one,
     // and they refill on a timer -- so you can throw a quick burst then must
     // pace yourself. Holding space feeds at the refill rate, never a flood.
     const CORN_MAG = 5;               // handfuls you can hold at once
-    const CORN_REFILL_FRAMES = 120;   // one handful back every 2s (~30/min)
-    const CORN_THROW_GAP = 14;        // min frames between throws (caps burst rate)
+    const CORN_REFILL_FRAMES = 120;   // one handful back every 2s to start with
+    const CORN_THROW_GAP = 12;        // min frames between throws (caps burst rate)
+    const CORN_LIMIT = 1500;          // most kernels allowed on the grass at once
+
+    // A big flock eats a LOT. Past a hundred birds the sacks get fatter and
+    // the supply comes back quicker, so you can actually keep up with them.
+    function bagKernels() { return Math.min(80, 26 + ((chickens.length / 6) | 0)); }
+    function refillFrames() { return Math.max(48, CORN_REFILL_FRAMES - chickens.length * 0.26); }
     let cornReady = CORN_MAG;
     let cornRefillCd = CORN_REFILL_FRAMES;
     let cornThrowCd = 0;
@@ -563,7 +606,8 @@
 
     // Lightning cooldown -- a long recharge so it can't be spammed
     let boltCd = 0;
-    const BOLT_COOLDOWN = 60 * 14; // 14 seconds
+    const BOLT_COOLDOWN = 60 * 3;  // zap away as often as you like...
+    const BOLT_ZAP_R = 40;         // ...but stand under it and you are toast
     let boltDeny = 0;              // flashes when pressed too early
 
     // ============================================================
@@ -576,18 +620,18 @@
     let score = 0;
     let scorePop = 0;                 // little bounce when the score jumps
     // --- Difficulty knobs (mutable so they're easy to tune) ---
-    let PLUMP_THRESHOLD = 1.5;        // a chicken this round counts as "plump"
-    let WIN_PLUMP = 6;                // this many plump chickens at once = you win!
-    let FATTEN_PER_KERNEL = 0.007;    // how much a kernel of corn fattens a hen
-    let METAB_PER_FRAME = 0;          // set >0 to make plump hens slowly burn fat
+    // THREE HUNDRED plump chickens. They never get very big -- they just
+    // keep multiplying until the farm is completely overrun, which is the point.
+    let PLUMP_THRESHOLD = 1.22;       // a chicken this round counts as "plump"
+    let WIN_PLUMP = 300;              // this many plump chickens at once = you win!
+    let MAX_FATNESS = 1.5;            // and no chicken ever gets rounder than this
+    let FATTEN_PER_KERNEL = 0.012;    // ~18 kernels to make one hen properly plump
+    let METAB_PER_FRAME = 0.00002;    // and she slowly slims again, so keep feeding
     // How switched-on the hens are. Lower = dumber = they blunder into hazards
     // unless you keep corn down somewhere safe to hold their attention.
     let HEN_SMARTS = 0.9;             // chance she thinks twice about a bad spot
     let HEN_PREDATOR_SENSE = 1.0;     // fraction of a predator's scare range she notices
 
-    // One single, friendly setting. No modes.
-    let FOX_WAVE = [1, 2, 2];         // fox pack size as you near the goal
-    let HAZARD_GAP_MIN = 55, HAZARD_GAP_RAND = 30;
 
     let coop = null;                  // the henhouse, built when you win
     let confetti = [];
@@ -651,11 +695,23 @@
             let d = dist(x, y, c.x, c.y);
             if (d < bestD) { bestD = d; best = c; }
         }
-        for (let b of bears) {
+        for (let b of predators) {
+            if (!b.bully) continue;
             let d = dist(x, y, b.x, b.y);
             if (d < bestD) { bestD = d; best = b; }
         }
         return best ? { obj: best, d: bestD } : null;
+    }
+
+    // Is this bird available to be chased and eaten? Anyone tucked up inside
+    // the castle, off with the bear, or marching to the coop is off the menu.
+    function huntable(c) {
+        return c && !c.dead && !c.safe && c.state !== 'exodus' && c.state !== 'toCoop';
+    }
+    // Is this bird free to be handed a job?
+    function idleHen(c) {
+        return c && !c.dead && !c.job && !c.crazy &&
+               c.state !== 'exodus' && c.state !== 'toCoop' && c.fatness > 0.75;
     }
 
     function drawShadow(x, y, radiusX, radiusY) {
@@ -780,8 +836,10 @@
             sndCluck();
             puff(this.x, this.y, 18, '#c9b184', 3.2);
             // Fling the kernels outwards -- they arc, bounce and roll to a stop
-            // A big messy splatter of corn flung everywhere
-            for (let i = 0; i < 32; i++) {
+            // A big messy splatter of corn flung everywhere. The more mouths
+            // there are to feed, the bigger the handful.
+            let n = bagKernels();
+            for (let i = 0; i < n; i++) {
                 let angle = Math.random() * Math.PI * 2;
                 let power = 1.6 + Math.random() * 5.0;
                 foods.push(new Food(this.x, this.y, {
@@ -789,6 +847,11 @@
                     vy: Math.sin(angle) * power * 0.45,
                     vz: 1.6 + Math.random() * 3.2
                 }));
+            }
+            // Never let the grass disappear under corn -- retire the oldest
+            // kernels (marking them eaten so nobody is left chasing a ghost).
+            if (foods.length > CORN_LIMIT) {
+                for (let i = 0, over = foods.length - CORN_LIMIT; i < over; i++) foods[i].consumed = true;
             }
         }
         draw() {
@@ -914,6 +977,19 @@
             this.hunger = 0;
             this.countedPlump = fatness >= PLUMP_THRESHOLD;
 
+            // Once there are enough of them, chickens take up hobbies.
+            this.job = null;      // build | guard | sit | soccer | inside
+            this.site = null;     // the project they belong to
+            this.slot = 0;        // which position on that project is theirs
+            this.tool = 0;
+            this.workCycle = 0;
+            this.atPost = false;  // actually standing on their mark, doing work
+            this.hidden = false;  // drawn by a building instead of by the flock
+            this.safe = false;    // tucked up inside the castle, can't be eaten
+            this.sitting = false;
+            this.guardCd = 0;
+            this.jab = 0;
+
             // Each bird keeps its own patch of yard and mooches around it, so
             // the flock spreads out instead of orbiting one spot.
             this.homeX = this.x;
@@ -946,17 +1022,18 @@
         layClutch() {
             let room = CHICKEN_CAP - chickens.length - eggs.length;
             if (room <= 0) { this.layCd = 60 * 5; return; }
-            let n = Math.min(room, 3 + Math.floor(Math.random() * 3));
+            let n = Math.min(room, 1 + Math.floor(Math.random() * 2));
             for (let i = 0; i < n; i++) {
                 let a = Math.random() * Math.PI * 2;
                 let r = 12 + Math.random() * 24;
                 let e = new Egg(this.x + Math.cos(a) * r, this.y + Math.sin(a) * r * 0.5);
-                e.crazy = crazyEra();
+                e.crazy = crazyEra() && Math.random() < CRAZY_HATCH;
                 eggs.push(e);
             }
-            this.fatness = Math.max(1.0, this.fatness - 0.45);
+            // She stays (just) plump through a clutch, so the flock still grows
+            this.fatness = Math.max(1.0, this.fatness - 0.20);
             this.countedPlump = this.fatness >= PLUMP_THRESHOLD; // can earn it again
-            this.layCd = 60 * 8;
+            this.layCd = 60 * 10;
             addScore(30); // laying a nest is good farming
             puff(this.x, this.y, 9, '#fff3c4', 1.6);
             heart(this.x, this.y - this.size);
@@ -993,8 +1070,10 @@
         separate() {
             let sx = 0, sy = 0, n = 0;
             let myR = 16 + this.size * 0.7;
-            for (let o of chickens) {
-                if (o === this || o.dead) continue;
+            let mob = nearHens(this.x, this.y);
+            for (let i = 0; i < mob.length; i++) {
+                let o = mob[i];
+                if (o === this || o.dead || o.hidden) continue;
                 let dx = this.x - o.x;
                 let dy = (this.y - o.y) * 2; // perspective: depth counts double
                 let d2 = dx * dx + dy * dy;
@@ -1026,10 +1105,12 @@
                     this.dead = true;
                     chickensHoused++;
                     puff(coop.doorX, coop.doorY, 8, '#fff2c8', 1.4);
-                    spawnConfetti(14);
-                    sndCluck();
+                    // only a few of them get their own burst -- with a flock this
+                    // big, one each would bury the whole screen in paper
+                    if (Math.random() < 0.06) spawnConfetti(5);
+                    if (Math.random() < 0.25) sndCluck();
                 } else {
-                    let sp = 1.8;
+                    let sp = 3.4;   // three hundred birds is a lot of parade
                     this.x += (dx / d) * sp;
                     this.y += (dy / d) * sp;
                     if (dx > 1) this.facingDir = 1; else if (dx < -1) this.facingDir = -1;
@@ -1050,13 +1131,23 @@
                 return;
             }
 
+            // --- Has this one got a job on? ---
+            // Nobody on a job can go and peck for themselves, so the rest of
+            // the flock brings them their lunch. They keep their condition.
+            if (this.job) {
+                if (this.fatness < 1) this.fatness = Math.min(1, this.fatness + 0.0012);
+                else if (this.fatness < PLUMP_THRESHOLD + 0.04) this.fatness += 0.0007;
+                if (this.job === 'inside' || this.job === 'patrol') return;  // the building runs them
+                if (this.updateJob()) return;
+            }
+
             // Chicks grow to full size on their own. Past 1.0 you only get
             // fatter by eating, and it is deliberately glacial.
-            if (this.fatness < 1) this.fatness = Math.min(1, this.fatness + 0.0005);
+            if (this.fatness < 1) this.fatness = Math.min(1, this.fatness + 0.0012);
             if (this.layCd > 0) this.layCd--;
 
-            // Metabolism: a plump hen slowly burns fat back toward normal, so
-            // you have to keep the whole flock fed to hold them all plump at once.
+            // Metabolism: a plump hen slowly slims back toward normal, so you
+            // have to keep the whole flock fed to hold them all plump at once.
             if (this.fatness > 1.0) this.fatness = Math.max(1.0, this.fatness - METAB_PER_FRAME);
 
             this.separate();
@@ -1105,25 +1196,13 @@
             let nearestThreatDist = Infinity;
             let threatX = 0, threatY = 0;
 
-            for (let f of foxes) {
-                let d = dist(this.x, this.y, f.x, f.y);
-                if (d < 180 && d < nearestThreatDist) { nearestThreatDist = d; threatX = f.x; threatY = f.y; }
-            }
             for (let c of cows) {
                 let d = dist(this.x, this.y, c.x, c.y);
                 if (d < 130 && d < nearestThreatDist) { nearestThreatDist = d; threatX = c.x; threatY = c.y; }
             }
-            for (let b of bears) {
-                let d = dist(this.x, this.y, b.x, b.y);
-                if (d < 220 && d < nearestThreatDist) { nearestThreatDist = d; threatX = b.x; threatY = b.y; }
-            }
-            // Wolves, gators and the farmer: a hen keeps her distance on her own... unless
-            // there is corn to be had. Greed beats fear -- that is the whole
-            // point of choosing where to drop it.
-            // A hen keeps clear of every hazard on her own -- even while walking
-            // to corn, she'll go around. The ONE exception is when the corn she
-            // is after sits inside the hazard itself: then greed wins, she walks
-            // in, and that is on you for putting it there.
+            // A hen keeps clear of anything with teeth on her own -- even while
+            // walking to corn, she'll go around. The ONE exception is when the
+            // corn she's after is sitting right inside the danger: greed wins.
             let chasingFood = (this.state === 'seek' && this.targetFood && !this.targetFood.consumed);
             let lureX = chasingFood ? this.targetFood.x : 0;
             let lureY = chasingFood ? this.targetFood.y : 0;
@@ -1134,12 +1213,6 @@
                 if (d < z.scare * HEN_PREDATOR_SENSE && d < nearestThreatDist) {
                     nearestThreatDist = d; threatX = z.x; threatY = z.y;
                 }
-            }
-            // Hens hate getting rained on -- they clear off before the puddle forms
-            for (let rc of rainClouds) {
-                if (rc.state !== 'rain') continue;
-                let d = dist(this.x, this.y, rc.x, rc.y);
-                if (d < 70 && d < nearestThreatDist) { nearestThreatDist = d; threatX = rc.x; threatY = rc.y; }
             }
 
             if (nearestThreatDist < 220) {
@@ -1165,7 +1238,7 @@
                         if (Math.random() < 0.10) sndCluck();
                         addScore(2); // a little something for every bite
                         // Get fatter -- very, very slowly. Cap at 2.2
-                        if (this.fatness < 2.4) this.fatness += FATTEN_PER_KERNEL;
+                        this.fatness = Math.min(MAX_FATNESS, this.fatness + FATTEN_PER_KERNEL);
                         if (Math.random() < 0.15) heart(this.x, this.y - this.size);
                         // First time it crosses into "plump" -- a big reward, this
                         // is what the whole game is about.
@@ -1186,13 +1259,18 @@
             if (this.state === 'wander') {
                 // Go for the nearest kernel nobody else has called dibs on
                 let closest = null; let minDist = Infinity;
-                for (let f of foods) {
+                // Look in the neighbouring cells first. Only when the field is
+                // nearly bare is it cheap enough to go looking everywhere.
+                let pool = nearCorn(this.x, this.y);
+                if (pool.length === 0 && foods.length <= 260) pool = foods;
+                for (let i = 0; i < pool.length; i++) {
+                    let f = pool[i];
                     if (f.consumed) continue;
                     if (f.claimedBy && f.claimedBy !== this && !f.claimedBy.dead) continue;
                     let d = dist(this.x, this.y, f.x, f.y);
                     // small random tiebreak so equidistant birds don't all agree
                     d *= 0.85 + Math.random() * 0.3;
-                    if (d < 400 && d < minDist) { minDist = d; closest = f; }
+                    if (d < 460 && d < minDist) { minDist = d; closest = f; }
                 }
 
                 if (closest) {
@@ -1244,6 +1322,118 @@
             this.walkCycle = isMoving ? this.walkCycle + 0.2 * currentSpeed : 0;
         }
 
+        // --- WORKING CHICKENS ------------------------------------------
+        // Anything with teeth nearby? Down tools.
+        jobScared() {
+            let z = killZones();
+            for (let i = 0; i < z.length; i++) {
+                if (dist(this.x, this.y, z[i].x, z[i].y) < z[i].scare * 0.85) return z[i];
+            }
+            return null;
+        }
+
+        updateJob() {
+            if (this.job === 'build')  return this.doBuild();
+            if (this.job === 'guard')  return this.doGuard();
+            if (this.job === 'sit')    return this.doSit();
+            if (this.job === 'soccer') return this.doSoccer();
+            return false;
+        }
+
+        // Walk to your mark on the site and swing your tool at it.
+        doBuild() {
+            let site = this.site;
+            if (!site || site.done) { releaseJob(this); return false; }
+            if (this.jobScared()) {          // downs tools, hard hat and all
+                puff(this.x, this.y - 12, 3, '#ffd23b', 1.3);
+                releaseJob(this);
+                return false;
+            }
+            let p = site.slotPos(this.slot);
+            if (dist(this.x, this.y, p.x, p.y) > 11) {
+                this.atPost = false;
+                this.moveTo(p.x, p.y, this.baseSpeed * 1.15);
+                this.walkCycle += 0.3;
+            } else {
+                this.atPost = true;
+                this.walkCycle = 0;
+                this.workCycle += 0.2;
+                this.face(site.x - this.x);
+                // sawdust flying off at the top of every swing
+                if (Math.sin(this.workCycle) > 0.985) {
+                    puff(this.x + this.facingDir * 10, this.y - this.size, 2, '#e0cba8', 1.0);
+                }
+            }
+            return true;
+        }
+
+        // Pitchfork brigade: patrol the yard, and see off anything that turns up.
+        doGuard() {
+            if (this.guardCd > 0) this.guardCd--;
+            if (this.jab > 0) this.jab--;
+            this.walkCycle += 0.3;
+            let best = null, bestD = 440;
+            for (let pr of predators) {
+                if (pr.scared || pr.hasChicken) continue;
+                let d = dist(this.x, this.y, pr.x, pr.y);
+                if (d < bestD) { bestD = d; best = pr; }
+            }
+            if (best && this.guardCd <= 0) {
+                this.moveTo(best.x, best.y, this.baseSpeed * 1.55);
+                this.alarm = 0;
+                if (bestD < 42) {
+                    this.guardCd = 100;
+                    this.jab = 20;
+                    if (Math.random() < 0.7) {
+                        best.scare();
+                        foxesZapped++; addScore(200);
+                        showBanner('THE GUARDS SEE IT OFF!', '#8aff6b');
+                        sndSparkle();
+                        puff(best.x, best.y, 14, '#ffe14d', 2.6);
+                    } else {
+                        // shrugged it off -- and now the guard has second thoughts
+                        this.flutter(best.x, best.y);
+                        this.guardCd = 150;
+                    }
+                }
+            } else {
+                // a slow loop of the whole yard
+                this.patrolT = (this.patrolT === undefined ? Math.random() * 6.283 : this.patrolT) + 0.007;
+                this.moveTo(clampX(canvas.width / 2 + Math.cos(this.patrolT) * canvas.width * 0.33),
+                            clampY((playArea.minY + playArea.maxY) / 2 + Math.sin(this.patrolT) * 140),
+                            this.baseSpeed * 0.85);
+            }
+            return true;
+        }
+
+        // Sit round the campfire toasting a marshmallow, as chickens do.
+        doSit() {
+            let site = this.site;
+            if (!site || !site.done) { releaseJob(this); return false; }
+            if (this.jobScared()) { releaseJob(this); return false; }
+            let p = site.slotPos(this.slot, true);
+            if (dist(this.x, this.y, p.x, p.y) > 9) {
+                this.sitting = false;
+                this.moveTo(p.x, p.y, this.baseSpeed);
+                this.walkCycle += 0.26;
+            } else {
+                this.sitting = true;
+                this.walkCycle = 0;
+                this.workCycle += 0.05;
+                this.face(site.x - this.x);
+            }
+            return true;
+        }
+
+        // Chase the ball. That's the whole job.
+        doSoccer() {
+            if (!ball) { releaseJob(this); return false; }
+            if (this.jobScared()) { releaseJob(this); return false; }
+            this.moveTo(ball.x, ball.y, this.baseSpeed * 1.4);
+            this.walkCycle += 0.36;
+            return true;
+        }
+
         // Returns true only if we actually covered ground, so the walk cycle
         // can't keep running while the bird is standing still.
         moveTo(tx, ty, speed) {
@@ -1287,9 +1477,10 @@
                 ctx.rotate(Math.sin((this.peckCycle / 15) * Math.PI) * (Math.PI / 4));
             }
             ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 3);
+            if (this.sitting) ctx.translate(0, size * 0.36);   // parked on her bottom
 
             // Legs (grounded stride only -- airborne legs are drawn dangling below)
-            if (lift === 0) {
+            if (lift === 0 && !this.sitting) {
                 ctx.strokeStyle = '#ffa500'; ctx.lineWidth = 2; ctx.beginPath();
                 let ls1 = Math.sin(this.walkCycle) * 5; let ls2 = Math.sin(this.walkCycle + Math.PI) * 5;
                 ctx.moveTo(-size * 0.2, size * 0.3); ctx.lineTo(-size * 0.2 + ls1, size * 0.8);
@@ -1370,6 +1561,24 @@
                 ctx.fillStyle = 'black';
                 ctx.beginPath(); ctx.arc(size - 6, -2, 2, 0, Math.PI * 2); ctx.fill();
             }
+
+            // --- Kit: hard hats, tools, pitchforks, marshmallows ---
+            if (this.job === 'build') {
+                drawHardHat(size);
+                ctx.save();
+                ctx.translate(size * 0.55, -size * 0.15);
+                ctx.rotate(-0.55 - Math.sin(this.workCycle) * (this.atPost ? 1.0 : 0.15));
+                drawTool(this.tool, size);
+                ctx.restore();
+            } else if (this.job === 'guard') {
+                drawHelmet(size);
+                ctx.save();
+                ctx.translate(size * 0.45, -size * 0.2);
+                ctx.rotate(this.jab > 0 ? 1.35 : -0.3 + Math.sin(this.walkCycle) * 0.14);
+                drawPitchfork(size);
+                ctx.restore();
+            }
+            if (this.sitting) drawMarshmallow(size);
             ctx.restore();
 
             // Panic marker floats above, drawn unflipped
@@ -1891,23 +2100,45 @@
         }
     }
 
-    class Fox {
-        constructor(forceSide) {
-            // Spawn left or right off-screen. A wave alternates sides so one
-            // lightning bolt can't clear the whole lot.
+    // ============================================================
+    //  PREDATORS
+    //  Fox, wolf, alligator and bear all behave identically: charge in,
+    //  grab the nearest hen, leg it. Every one of them is scared off by
+    //  a bolt of lightning. Only the art and the numbers differ.
+    // ============================================================
+
+    // The very limp chicken hanging out of a predator's mouth
+    function drawLimpHen(x, y) {
+        ctx.fillStyle = 'white';
+        ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#cc0000'; ctx.fillRect(x - 2, y - 3, 3, 3);
+        ctx.strokeStyle = '#ffa500'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x + 2, y + 4); ctx.lineTo(x + 6, y + 9); ctx.stroke();
+    }
+
+    class Hunter {
+        constructor(kind, opts, forceSide) {
+            this.kind = kind;
             let left = forceSide === undefined ? (Math.random() > 0.5) : (forceSide < 0);
-            this.x = left ? -50 : canvas.width + 50;
-            this.y = horizonY + 40 + Math.random() * (canvas.height - horizonY - 80);
-            this.speed = 4;
-            this.facingDir = 1;
+            this.x = left ? -70 : canvas.width + 70;
+            this.y = playArea.minY + 20 + Math.random() * (playArea.maxY - playArea.minY - 20);
+            this.speed = opts.speed;
+            this.grabR = opts.grabR;         // how close before it grabs
+            this.scareR = opts.scareR;       // how far off a hen notices it
+            this.patience = opts.patience;   // seconds before it gives up and goes home
+            this.bully = !!opts.bully;       // big enough that hens scatter on sight
+            this.label = opts.label;
+            this.facingDir = left ? 1 : -1;
             this.walkCycle = 0;
+            this.arrive = 0;
+            this.chomp = 0;
+            this.life = 0;
             this.active = true;
             this.hasChicken = false;
+            this.snatched = false;
             this.scared = false;
-            this.life = 0;
-
             this.targetChicken = pickPrey(this);
-            this.exitX = this.x < 0 ? canvas.width + 100 : -100; // run to the far side
+            this.exitX = left ? canvas.width + 160 : -160;
         }
 
         // Zapped: abandon the hunt entirely and sprint for the nearest edge.
@@ -1915,102 +2146,237 @@
             if (this.scared) return;
             this.scared = true;
             this.targetChicken = null;
-            this.speed = 7;
-            // bolt for whichever side is closer, not all the way across
-            this.exitX = (this.x < canvas.width / 2) ? -100 : canvas.width + 100;
-            puff(this.x, this.y, 8, '#d9d0b0', 2.0);
+            this.speed = this.speed * 1.7 + 1.6;
+            this.exitX = (this.x < canvas.width / 2) ? -160 : canvas.width + 160;
+            puff(this.x, this.y, 9, '#eee6cc', 2.2);
         }
 
         update() {
             this.life++;
-            // Give up after ~18s so a fox never loiters forever
-            if (this.life > 60 * 18) this.hasChicken = true;
+            this.arrive = Math.min(1, this.arrive + 0.04);
+            if (this.life > 60 * this.patience) this.hasChicken = true;   // gives up
 
-            if (!this.scared && !this.hasChicken &&
-                (!this.targetChicken || this.targetChicken.dead || this.targetChicken.state === 'toCoop')) {
+            if (!this.scared && !this.hasChicken && !huntable(this.targetChicken)) {
                 this.targetChicken = pickPrey(this);
             }
 
             let tx, ty;
             if (!this.scared && !this.hasChicken && this.targetChicken) {
-                tx = this.targetChicken.x;
-                ty = this.targetChicken.y;
-                if (dist(this.x, this.y, tx, ty) < 18) {
-                    this.targetChicken.dead = true;
-                    featherBurst(this.targetChicken.x, this.targetChicken.y);
+                tx = this.targetChicken.x; ty = this.targetChicken.y;
+                if (dist(this.x, this.y, tx, ty) < this.grabR) {
+                    eatChicken(this.targetChicken);
                     this.hasChicken = true;
-                    chickensLost++;
-                    sndYip();
+                    this.snatched = true;
+                    this.chomp = 18;
                 }
             } else {
-                tx = this.exitX;
-                ty = this.y;
+                tx = this.exitX; ty = this.y;
             }
 
-            let dx = tx - this.x; let dy = ty - this.y;
+            let dx = tx - this.x, dy = ty - this.y;
             let d = Math.sqrt(dx * dx + dy * dy);
             if (d > 1) {
                 this.x += (dx / d) * this.speed;
-                this.y += (dy / d) * (this.speed * 0.7);
+                this.y = clampY(this.y + (dy / d) * (this.speed * 0.7));
             }
             if (Math.abs(dx) > 0.5) this.facingDir = dx > 0 ? 1 : -1;
+            if (this.chomp > 0) this.chomp--;
+            this.walkCycle += this.speed * 0.11;
 
             // Off the edge of the yard? Then it's gone.
             if ((this.scared || this.hasChicken || !this.targetChicken) &&
-                (this.x < -80 || this.x > canvas.width + 80)) {
-                this.active = false;
-            }
-
-            this.walkCycle += 0.4;
+                (this.x < -140 || this.x > canvas.width + 140)) this.active = false;
         }
+    }
 
+    class Fox extends Hunter {
+        constructor(side) {
+            super('fox', { speed: 4.0, grabR: 18, scareR: 150, patience: 18, label: 'A FOX!' }, side);
+        }
         draw() {
             drawShadow(this.x, this.y, 20, 8);
             ctx.save();
             ctx.translate(this.x, this.y);
             ctx.scale(this.facingDir, 1);
-
-            // Bounding run
             ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 6);
-
-            // Legs
             ctx.strokeStyle = '#222'; ctx.lineWidth = 3; ctx.beginPath();
-            let ls1 = Math.sin(this.walkCycle) * 10; let ls2 = Math.sin(this.walkCycle + Math.PI) * 10;
+            let ls1 = Math.sin(this.walkCycle) * 10, ls2 = Math.sin(this.walkCycle + Math.PI) * 10;
             ctx.moveTo(-10, 5); ctx.lineTo(-10 + ls1, 15);
             ctx.moveTo(10, 5); ctx.lineTo(10 + ls2, 15);
             ctx.stroke();
-
-            // Tail
             ctx.fillStyle = '#ff7700';
             ctx.beginPath(); ctx.ellipse(-20, -5, 12, 5, Math.PI / 6 + Math.sin(this.walkCycle) * 0.2, 0, Math.PI * 2); ctx.fill();
-            // Tail tip
             ctx.fillStyle = 'white';
             ctx.beginPath(); ctx.arc(-30, -10, 4, 0, Math.PI * 2); ctx.fill();
-
-            // Body
             ctx.fillStyle = '#d95a00';
             ctx.beginPath(); ctx.ellipse(0, 0, 18, 8, 0, 0, Math.PI * 2); ctx.fill();
-
-            // Head/Snout
             ctx.beginPath(); ctx.moveTo(10, -5); ctx.lineTo(25, 2); ctx.lineTo(10, 5); ctx.fill();
-
-            // Ears
             ctx.fillStyle = '#222';
             ctx.beginPath(); ctx.moveTo(8, -5); ctx.lineTo(5, -12); ctx.lineTo(12, -2); ctx.fill();
-
-            // Eye
             ctx.fillStyle = '#ffe08a';
             ctx.fillRect(12, -4, 3, 2);
+            if (this.hasChicken && this.snatched) drawLimpHen(22, 5);
+            ctx.restore();
+        }
+    }
 
-            if (this.hasChicken) {
-                // A very limp chicken in the mouth
-                ctx.fillStyle = 'white';
-                ctx.beginPath(); ctx.arc(22, 5, 6, 0, Math.PI * 2); ctx.fill();
-                ctx.fillStyle = '#cc0000'; ctx.fillRect(20, 2, 3, 3);
-                ctx.strokeStyle = '#ffa500'; ctx.lineWidth = 2;
-                ctx.beginPath(); ctx.moveTo(24, 9); ctx.lineTo(28, 14); ctx.stroke();
+    class Wolf extends Hunter {
+        constructor(side) {
+            super('wolf', { speed: 3.5, grabR: 26, scareR: 175, patience: 22, label: 'A WOLF!' }, side);
+        }
+        draw() {
+            drawShadow(this.x, this.y, 30, 11);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir, 1);
+            ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 4);
+            let sw = Math.sin(this.walkCycle) * 9;
+            // legs
+            ctx.strokeStyle = '#3b3f45'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(-14, 2); ctx.lineTo(-14 + sw, 20);
+            ctx.moveTo(-5, 2); ctx.lineTo(-5 - sw * 0.6, 20);
+            ctx.moveTo(9, 2); ctx.lineTo(9 - sw * 0.6, 20);
+            ctx.moveTo(18, 2); ctx.lineTo(18 + sw, 20);
+            ctx.stroke(); ctx.lineCap = 'butt';
+            // bushy tail streaming behind
+            ctx.fillStyle = '#4a5058';
+            ctx.beginPath(); ctx.ellipse(-24, -6, 13, 6, -0.4 + Math.sin(this.walkCycle) * 0.25, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#5a616b';
+            ctx.beginPath(); ctx.ellipse(0, -6, 22, 11, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#4a5058';
+            ctx.beginPath(); ctx.ellipse(9, -8, 11, 10, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#5a616b';
+            ctx.beginPath(); ctx.ellipse(21, -13, 11, 8, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(27, -14); ctx.lineTo(40, -10); ctx.lineTo(27, -6); ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#20242a';
+            ctx.beginPath(); ctx.arc(39, -10, 2.4, 0, Math.PI * 2); ctx.fill();
+            if (this.chomp > 0) {
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath(); ctx.moveTo(30, -10); ctx.lineTo(34, -5); ctx.lineTo(36, -10); ctx.closePath(); ctx.fill();
             }
+            ctx.fillStyle = '#4a5058';
+            ctx.beginPath(); ctx.moveTo(16, -19); ctx.lineTo(19, -29); ctx.lineTo(23, -18); ctx.closePath(); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(24, -19); ctx.lineTo(28, -28); ctx.lineTo(30, -17); ctx.closePath(); ctx.fill();
+            // silly glowing eye
+            let glow = 0.65 + Math.sin(frameCount * 0.12) * 0.35;
+            ctx.globalAlpha = glow;
+            ctx.fillStyle = '#ff2b2b';
+            ctx.beginPath(); ctx.arc(24, -15, 4.2, 0, Math.PI * 2); ctx.fill();
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = '#ff0000';
+            ctx.beginPath(); ctx.arc(24, -15, 2.3, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#ffd0d0';
+            ctx.fillRect(23.3, -16.2, 1.4, 1.4);
+            if (this.hasChicken && this.snatched) drawLimpHen(38, -4);
+            ctx.restore();
+        }
+    }
 
+    class Gator extends Hunter {
+        constructor(side) {
+            super('gator', { speed: 3.0, grabR: 30, scareR: 175, patience: 24, label: 'ALLIGATOR!' }, side);
+        }
+        draw() {
+            drawShadow(this.x, this.y, 42, 10);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir, 1);
+            // low waddling scuttle
+            let wag = Math.sin(this.walkCycle * 0.8);
+            ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 2);
+            let jaw = this.chomp > 0 ? 10 : 2 + Math.sin(frameCount * 0.06) * 1.4;
+            // tail, swishing side to side as it runs
+            ctx.fillStyle = '#3f6b3a';
+            ctx.beginPath(); ctx.moveTo(-30, -6); ctx.lineTo(-62, 2 + wag * 8); ctx.lineTo(-30, 4); ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#4c7d44';
+            ctx.beginPath(); ctx.ellipse(-6, -4, 30, 10, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#3f6b3a';
+            for (let i = -3; i < 4; i++) {
+                ctx.beginPath(); ctx.moveTo(i * 8 - 4, -12); ctx.lineTo(i * 8, -18); ctx.lineTo(i * 8 + 4, -12); ctx.closePath(); ctx.fill();
+            }
+            // stubby scurrying legs
+            let sw = Math.sin(this.walkCycle) * 6;
+            ctx.strokeStyle = '#3f6b3a'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(-16, 2); ctx.lineTo(-16 + sw, 12);
+            ctx.moveTo(10, 2); ctx.lineTo(10 - sw, 12);
+            ctx.stroke(); ctx.lineCap = 'butt';
+            ctx.fillStyle = '#4c7d44';
+            ctx.beginPath(); ctx.moveTo(20, -10); ctx.lineTo(62, -6 - jaw * 0.3); ctx.lineTo(62, -1 - jaw * 0.3); ctx.lineTo(20, -1); ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#43703c';
+            ctx.beginPath(); ctx.moveTo(20, 0); ctx.lineTo(60, 1 + jaw); ctx.lineTo(60, 5 + jaw); ctx.lineTo(20, 4); ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#ffffff';
+            for (let i = 0; i < 5; i++) {
+                let tx = 28 + i * 7;
+                ctx.beginPath(); ctx.moveTo(tx, -1); ctx.lineTo(tx + 3, 3); ctx.lineTo(tx + 5, -1); ctx.closePath(); ctx.fill();
+            }
+            ctx.fillStyle = '#4c7d44';
+            ctx.beginPath(); ctx.arc(22, -14, 6, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#e8d24a';
+            ctx.beginPath(); ctx.arc(23, -14, 3.4, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#000';
+            ctx.fillRect(22.4, -16.4, 1.6, 4.8);
+            if (this.hasChicken && this.snatched) drawLimpHen(52, 4);
+            ctx.restore();
+        }
+    }
+
+    class Bear extends Hunter {
+        constructor(side) {
+            super('bear', { speed: 3.1, grabR: 34, scareR: 240, patience: 26, bully: true, label: 'A BEAR!' }, side);
+            this.calledExodus = false;
+            this.dustCd = 0;
+        }
+        update() {
+            // The crazy ones always leave with the bear -- that never changes
+            if (!this.calledExodus && !this.scared && this.x > -20 && this.x < canvas.width + 20) {
+                this.calledExodus = true;
+                let dirOut = this.x < canvas.width / 2 ? -1 : 1;
+                let crazies = chickens.filter(c => c.crazy && c.state !== 'exodus');
+                if (crazies.length > 0) {
+                    showBanner('THE CRAZY ONES LEAVE!', '#ff6bcb');
+                    crazies.forEach(c => { releaseJob(c); c.startExodus(dirOut); });
+                }
+            }
+            if (--this.dustCd <= 0) {
+                this.dustCd = 6;
+                puff(this.x - 20 * this.facingDir, this.y + 4, 2, '#8f9c6a', 1.0);
+            }
+            super.update();
+        }
+        draw() {
+            drawShadow(this.x, this.y, 32, 12);
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.facingDir, 1);
+            ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 5);
+            let front = Math.sin(this.walkCycle) * 11;
+            let back = Math.sin(this.walkCycle + 2.4) * 11;
+            ctx.strokeStyle = '#3a2416'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(-16, 0); ctx.lineTo(-16 + back, 18);
+            ctx.moveTo(-6, 0); ctx.lineTo(-6 + back * 0.8, 18);
+            ctx.moveTo(12, 0); ctx.lineTo(12 + front * 0.8, 18);
+            ctx.moveTo(21, 0); ctx.lineTo(21 + front, 18);
+            ctx.stroke();
+            ctx.lineCap = 'butt';
+            ctx.fillStyle = '#4a2f1c';
+            ctx.beginPath(); ctx.ellipse(0, -10, 27, 15, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(8, -20, 13, 9, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(28, -18, 13, 11, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(23, -28, 5, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(34, -27, 5, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#8a6a4a';
+            ctx.beginPath(); ctx.ellipse(38, -14, 8, 6, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#1a1008';
+            ctx.beginPath(); ctx.arc(44, -15, 3, 0, Math.PI * 2); ctx.fill();
+            ctx.fillRect(30, -22, 3, 3);
+            if (this.chomp > 0) {
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath(); ctx.moveTo(34, -12); ctx.lineTo(38, -6); ctx.lineTo(42, -12); ctx.closePath(); ctx.fill();
+            }
+            if (this.hasChicken && this.snatched) drawLimpHen(46, -6);
             ctx.restore();
         }
     }
@@ -2141,7 +2507,7 @@
                 // something big lumbering past sends them up in a cloud
                 for (let o of cows) if (dist(this.x, this.y, o.x, o.y) < 75) this.spook = 45;
                 for (let o of horses) if (dist(this.x, this.y, o.x, o.y) < 70) this.spook = 45;
-                for (let o of bears) if (dist(this.x, this.y, o.x, o.y) < 80) this.spook = 45;
+                for (let o of predators) if (o.bully && dist(this.x, this.y, o.x, o.y) < 80) this.spook = 45;
             }
             if (this.spook > 0) this.spook--;
 
@@ -2233,7 +2599,7 @@
             if (this.state !== 'leave' && !this.swarm) {
                 let spooked = nearestBully(this.x, this.y, 120);
                 if (!spooked) {
-                    for (let f of foxes) {
+                    for (let f of predators) {
                         if (dist(this.x, this.y, f.x, f.y) < 150) { spooked = true; break; }
                     }
                 }
@@ -2383,6 +2749,26 @@
         }
     }
 
+    // A great tide of rabbits pours across the field and straight out the
+    // other side. There is no reason for it and no way to stop it.
+    function triggerRabbitStampede() {
+        let dir = Math.random() > 0.5 ? 1 : -1;
+        let n = 14 + Math.floor(Math.random() * 8);
+        showBanner('RABBIT STAMPEDE!', '#f0e2cc');
+        for (let i = 0; i < n; i++) {
+            let r = new Rabbit();
+            r.swarm = true;
+            r.speed = 3.2 + Math.random() * 1.8;
+            r.dir = dir;
+            r.facingDir = dir;
+            r.x = dir === 1 ? -60 - i * 34 : canvas.width + 60 + i * 34;
+            r.exitX = dir === 1 ? canvas.width + 170 : -170;
+            r.y = clampY(playArea.minY + Math.random() * (playArea.maxY - playArea.minY));
+            r.state = 'leave';
+            rabbits.push(r);
+        }
+    }
+
     // ============================================================
     //  HAZARDS
     //  Each one makes a patch of the yard unsafe. Hens naturally shy
@@ -2400,207 +2786,17 @@
         return true;
     }
 
-    class Wolf {
-        constructor() {
-            this.dir = Math.random() > 0.5 ? 1 : -1;
-            this.x = this.dir === 1 ? -70 : canvas.width + 70;
-            this.y = playArea.minY + 40 + Math.random() * (playArea.maxY - playArea.minY - 60);
-            this.homeX = playArea.minX + 150 + Math.random() * (playArea.maxX - playArea.minX - 300);
-            this.facingDir = this.dir;
-            this.speed = 2.4;
-            this.state = 'arrive';
-            this.lurk = 60 * (11 + Math.random() * 6); // hangs about this long
-            this.walkCycle = 0;
-            this.blink = 0;
-            this.active = true;
-            this.scared = false;
-            this.killR = 52; this.scareR = 98;
-        }
-        // Zapped -- it gives up and bolts
-        scare() {
-            if (this.scared) return;
-            this.scared = true;
-            this.state = 'leave';
-            this.speed = 5.5;
-            this.dir = (this.x < canvas.width / 2) ? -1 : 1;
-            puff(this.x, this.y, 8, '#c9cdd4', 2.0);
-        }
-        update() {
-            this.walkCycle += 0.18;
-            if (this.state === 'arrive') {
-                let dx = this.homeX - this.x;
-                if (Math.abs(dx) < 4) { this.state = 'lurk'; }
-                else { this.x += Math.sign(dx) * this.speed; this.facingDir = Math.sign(dx); }
-            } else if (this.state === 'lurk') {
-                // shifts about a little, looking for a meal
-                this.x += Math.sin(frameCount * 0.01) * 0.3;
-                if (--this.lurk <= 0) { this.state = 'leave'; }
-                if (Math.random() < 0.01) this.facingDir *= -1;
-            } else {
-                this.x += this.dir * this.speed;
-                if (this.x < -110 || this.x > canvas.width + 110) this.active = false;
-            }
-            // Only snaps once it has settled -- so the flock gets a moment to
-            // scatter as it walks in, and deaths come from bad corn placement
-            // rather than bad luck.
-            if (this.state === 'lurk') {
-                for (let c of chickens) {
-                    if (c.dead || c.state === 'exodus' || c.state === 'toCoop') continue;
-                    if (dist(this.x, this.y, c.x, c.y) < this.killR) {
-                        if (eatChicken(c, 'wolf')) { this.chomp = 12; }
-                    }
-                }
-            }
-            if (this.chomp > 0) this.chomp--;
-        }
-        draw() {
-            drawShadow(this.x, this.y, 30, 11);
-            ctx.save();
-            ctx.translate(this.x, this.y);
-            ctx.scale(this.facingDir, 1);
-            let bob = this.state === 'lurk' ? Math.sin(frameCount * 0.05) * 1.2 : -Math.abs(Math.sin(this.walkCycle)) * 3;
-            ctx.translate(0, bob);
-            let sw = this.state === 'lurk' ? Math.sin(frameCount * 0.06) * 2 : Math.sin(this.walkCycle) * 8;
-            // legs
-            ctx.strokeStyle = '#3b3f45'; ctx.lineWidth = 4; ctx.lineCap = 'round';
-            ctx.beginPath();
-            ctx.moveTo(-14, 2); ctx.lineTo(-14 + sw, 20);
-            ctx.moveTo(-5, 2); ctx.lineTo(-5 - sw * 0.6, 20);
-            ctx.moveTo(9, 2); ctx.lineTo(9 - sw * 0.6, 20);
-            ctx.moveTo(18, 2); ctx.lineTo(18 + sw, 20);
-            ctx.stroke(); ctx.lineCap = 'butt';
-            // bushy tail
-            ctx.fillStyle = '#4a5058';
-            ctx.beginPath(); ctx.ellipse(-24, -6, 13, 6, -0.4 + Math.sin(frameCount * 0.05) * 0.15, 0, Math.PI * 2); ctx.fill();
-            // body
-            ctx.fillStyle = '#5a616b';
-            ctx.beginPath(); ctx.ellipse(0, -6, 22, 11, 0, 0, Math.PI * 2); ctx.fill();
-            // shaggy ruff
-            ctx.fillStyle = '#4a5058';
-            ctx.beginPath(); ctx.ellipse(9, -8, 11, 10, 0, 0, Math.PI * 2); ctx.fill();
-            // head
-            ctx.fillStyle = '#5a616b';
-            ctx.beginPath(); ctx.ellipse(21, -13, 11, 8, 0, 0, Math.PI * 2); ctx.fill();
-            // snout
-            ctx.beginPath(); ctx.moveTo(27, -14); ctx.lineTo(40, -10); ctx.lineTo(27, -6); ctx.closePath(); ctx.fill();
-            ctx.fillStyle = '#20242a';
-            ctx.beginPath(); ctx.arc(39, -10, 2.4, 0, Math.PI * 2); ctx.fill();
-            // teeth when it snaps
-            if (this.chomp > 0) {
-                ctx.fillStyle = '#ffffff';
-                ctx.beginPath(); ctx.moveTo(30, -10); ctx.lineTo(34, -5); ctx.lineTo(36, -10); ctx.closePath(); ctx.fill();
-            }
-            // ears
-            ctx.fillStyle = '#4a5058';
-            ctx.beginPath(); ctx.moveTo(16, -19); ctx.lineTo(19, -29); ctx.lineTo(23, -18); ctx.closePath(); ctx.fill();
-            ctx.beginPath(); ctx.moveTo(24, -19); ctx.lineTo(28, -28); ctx.lineTo(30, -17); ctx.closePath(); ctx.fill();
-            // EVIL RED EYES -- glowing, with a menacing flicker
-            let glow = 0.65 + Math.sin(frameCount * 0.12) * 0.35;
-            ctx.globalAlpha = glow;
-            ctx.fillStyle = '#ff2b2b';
-            ctx.beginPath(); ctx.arc(24, -15, 4.2, 0, Math.PI * 2); ctx.fill();
-            ctx.globalAlpha = 1;
-            ctx.fillStyle = '#ff0000';
-            ctx.beginPath(); ctx.arc(24, -15, 2.3, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = '#ffd0d0';
-            ctx.fillRect(23.3, -16.2, 1.4, 1.4);
-            ctx.restore();
-        }
-    }
-
-    class Gator {
-        constructor() {
-            this.side = Math.random() > 0.5 ? 1 : -1; // -1 = left edge, 1 = right
-            this.y = playArea.minY + 50 + Math.random() * (playArea.maxY - playArea.minY - 80);
-            // resting spot is just INSIDE the field, so it's visible once out
-            this.x = this.side === -1 ? playArea.minX + 48 : playArea.maxX - 48;
-            this.facingDir = this.side === -1 ? 1 : -1; // faces into the field
-            this.emerge = 0;                 // 0..1 slides out of the edge
-            this.life = 60 * (13 + Math.random() * 7);
-            this.snap = 0;
-            this.active = true;
-            this.scared = false;
-            this.killR = 60; this.scareR = 98;
-        }
-        // Zapped -- retreats immediately
-        scare() {
-            if (this.scared) return;
-            this.scared = true;
-            this.life = 0;                 // starts sliding back out of view
-            puff(this.x, this.y, 8, '#8fc08a', 2.0);
-        }
-        update() {
-            this.life--;
-            if (this.life > 60 * 3) {
-                this.emerge = Math.min(1, this.emerge + 0.02);   // slides out
-            } else {
-                this.emerge = Math.max(0, this.emerge - 0.02);   // slides back
-                if (this.emerge <= 0) this.active = false;       // gone the moment it's back in
-            }
-            if (this.snap > 0) this.snap--;
-            if (this.emerge > 0.6 && !this.scared) {
-                for (let c of chickens) {
-                    if (c.dead || c.state === 'exodus' || c.state === 'toCoop') continue;
-                    if (dist(this.x, this.y, c.x, c.y) < this.killR) {
-                        if (eatChicken(c, 'gator')) this.snap = 16;
-                    }
-                }
-            }
-        }
-        draw() {
-            let e = this.emerge;
-            if (e <= 0.02) return;
-            let px = this.x + (this.side === -1 ? -1 : 1) * (1 - e) * 95;
-            drawShadow(px, this.y, 40 * e, 10 * e);
-            ctx.save();
-            ctx.translate(px, this.y);
-            ctx.scale(this.facingDir, 1);
-            let jaw = this.snap > 0 ? 9 : 2 + Math.sin(frameCount * 0.04) * 1.2;
-            // tail
-            ctx.fillStyle = '#3f6b3a';
-            ctx.beginPath(); ctx.moveTo(-30, -6); ctx.lineTo(-62, 2); ctx.lineTo(-30, 4); ctx.closePath(); ctx.fill();
-            // body
-            ctx.fillStyle = '#4c7d44';
-            ctx.beginPath(); ctx.ellipse(-6, -4, 30, 10, 0, 0, Math.PI * 2); ctx.fill();
-            // scaly ridges
-            ctx.fillStyle = '#3f6b3a';
-            for (let i = -3; i < 4; i++) {
-                ctx.beginPath(); ctx.moveTo(i * 8 - 4, -12); ctx.lineTo(i * 8, -18); ctx.lineTo(i * 8 + 4, -12); ctx.closePath(); ctx.fill();
-            }
-            // legs
-            ctx.fillStyle = '#3f6b3a';
-            ctx.fillRect(-16, 2, 7, 9); ctx.fillRect(8, 2, 7, 9);
-            // upper jaw
-            ctx.fillStyle = '#4c7d44';
-            ctx.beginPath(); ctx.moveTo(20, -10); ctx.lineTo(62, -6 - jaw * 0.3); ctx.lineTo(62, -1 - jaw * 0.3); ctx.lineTo(20, -1); ctx.closePath(); ctx.fill();
-            // lower jaw (opens)
-            ctx.fillStyle = '#43703c';
-            ctx.beginPath(); ctx.moveTo(20, 0); ctx.lineTo(60, 1 + jaw); ctx.lineTo(60, 5 + jaw); ctx.lineTo(20, 4); ctx.closePath(); ctx.fill();
-            // teeth
-            ctx.fillStyle = '#ffffff';
-            for (let i = 0; i < 5; i++) {
-                let tx = 28 + i * 7;
-                ctx.beginPath(); ctx.moveTo(tx, -1); ctx.lineTo(tx + 3, 3); ctx.lineTo(tx + 5, -1); ctx.closePath(); ctx.fill();
-            }
-            // eye ridge + eye
-            ctx.fillStyle = '#4c7d44';
-            ctx.beginPath(); ctx.arc(22, -14, 6, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = '#e8d24a';
-            ctx.beginPath(); ctx.arc(23, -14, 3.4, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = '#000';
-            ctx.fillRect(22.4, -16.4, 1.6, 4.8);
-            ctx.restore();
-        }
-    }
-
+    // The angry farmer. He turns up shouting about his lawn, and then a
+    // chicken looks at him and he completely loses his nerve and runs away.
+    // He has never hurt anybody.
     class Farmer {
         constructor() {
             this.dir = Math.random() > 0.5 ? 1 : -1;
             this.x = this.dir === 1 ? -50 : canvas.width + 50;
             this.y = playArea.minY + 60 + Math.random() * (playArea.maxY - playArea.minY - 90);
             this.stopX = this.dir === 1
-                ? playArea.minX + 120 + Math.random() * 200
-                : playArea.maxX - 120 - Math.random() * 200;
+                ? playArea.minX + 160 + Math.random() * 260
+                : playArea.maxX - 160 - Math.random() * 260;
             this.facingDir = this.dir;
             this.speed = 2.0;
             this.state = 'arrive';
@@ -2608,40 +2804,37 @@
             this.walkCycle = 0;
             this.active = true;
             this.scared = false;
-            this.grab = 0;
-            this.killR = 58;     // get within arm's reach and he grabs one
-            this.scareR = 125;
+            this.panicked = 0;
         }
-        // Zapped -- he's had enough and stomps off
-        scare() {
+        // Lightning does it too -- he is not a brave man
+        scare() { this.panic(); }
+        panic() {
             if (this.scared) return;
             this.scared = true;
+            this.panicked = 1;
             this.state = 'leave';
             this.facingDir = -this.dir;
-            this.speed = 4.5;
-            puff(this.x, this.y - 20, 8, '#e8d8b8', 2.0);
+            this.speed = 5.4;
+            showBanner('THE FARMER RUNS AWAY!', '#ffbe50');
+            sndDud();
+            puff(this.x, this.y - 20, 10, '#e8d8b8', 2.4);
         }
         update() {
-            this.walkCycle += 0.22;
+            this.walkCycle += this.state === 'leave' ? 0.42 : 0.22;
             if (this.state === 'arrive') {
                 let dx = this.stopX - this.x;
                 if (Math.abs(dx) < 5) this.state = 'rant';
                 else { this.x += Math.sign(dx) * this.speed; this.facingDir = Math.sign(dx); }
             } else if (this.state === 'rant') {
-                if (--this.rant <= 0) { this.state = 'leave'; this.facingDir = -this.dir; }
+                // one chicken wanders over to see what all the noise is about
+                for (let c of nearHens(this.x, this.y)) {
+                    if (!huntable(c) || c.hidden) continue;
+                    if (dist(this.x, this.y, c.x, c.y) < 90) { this.panic(); break; }
+                }
+                if (this.state === 'rant' && --this.rant <= 0) { this.state = 'leave'; this.facingDir = -this.dir; }
             } else {
                 this.x -= this.dir * this.speed;
-                if (this.x < -90 || this.x > canvas.width + 90) this.active = false;
-            }
-            if (this.grab > 0) this.grab--;
-            // Once he's stopped and shouting, anything in arm's reach gets nabbed
-            if (this.state === 'rant') {
-                for (let c of chickens) {
-                    if (c.dead || c.state === 'exodus' || c.state === 'toCoop') continue;
-                    if (dist(this.x, this.y, c.x, c.y) < this.killR) {
-                        if (eatChicken(c, 'farmer')) this.grab = 16;
-                    }
-                }
+                if (this.x < -110 || this.x > canvas.width + 110) this.active = false;
             }
         }
         draw() {
@@ -2650,159 +2843,136 @@
             ctx.translate(this.x, this.y);
             ctx.scale(this.facingDir, 1);
             let ranting = this.state === 'rant';
-            let step = this.state === 'rant' ? 0 : Math.sin(this.walkCycle) * 6;
+            let fleeing = this.state === 'leave' && this.panicked;
+            let step = ranting ? 0 : Math.sin(this.walkCycle) * (fleeing ? 11 : 6);
             let wave = ranting ? Math.sin(frameCount * 0.35) * 22 : 0;
-            let hop = ranting ? Math.abs(Math.sin(frameCount * 0.18)) * 3 : 0;
+            let hop = ranting ? Math.abs(Math.sin(frameCount * 0.18)) * 3
+                              : (fleeing ? Math.abs(Math.sin(this.walkCycle)) * 5 : 0);
             ctx.translate(0, -hop);
-            // legs (denim)
             ctx.strokeStyle = '#3a5a8c'; ctx.lineWidth = 6; ctx.lineCap = 'round';
             ctx.beginPath();
             ctx.moveTo(-3, -18); ctx.lineTo(-3 + step, 2);
             ctx.moveTo(3, -18); ctx.lineTo(3 - step, 2);
             ctx.stroke();
-            // boots
             ctx.fillStyle = '#4a3520';
             ctx.fillRect(-7 + step, 0, 9, 4); ctx.fillRect(-1 - step, 0, 9, 4);
-            // body / overalls
             ctx.fillStyle = '#4f7fbf';
             ctx.fillRect(-9, -42, 18, 26);
-            // shirt sleeves
             ctx.fillStyle = '#c9524a';
             ctx.fillRect(-11, -42, 22, 9);
-            // arms -- one shaking a fist
             ctx.strokeStyle = '#e8b98c'; ctx.lineWidth = 4;
             ctx.beginPath();
-            ctx.moveTo(-9, -38); ctx.lineTo(-16, -30 + step * 0.4);
-            ctx.moveTo(9, -38); ctx.lineTo(17, -44 - wave);
+            if (fleeing) {
+                // both arms straight up in the air, flapping
+                let f = Math.sin(this.walkCycle * 1.6) * 5;
+                ctx.moveTo(-9, -38); ctx.lineTo(-14, -58 + f);
+                ctx.moveTo(9, -38); ctx.lineTo(14, -58 - f);
+            } else {
+                ctx.moveTo(-9, -38); ctx.lineTo(-16, -30 + step * 0.4);
+                ctx.moveTo(9, -38); ctx.lineTo(17, -44 - wave);
+            }
             ctx.stroke();
             ctx.lineCap = 'butt';
-            // fist
-            ctx.fillStyle = '#e8b98c';
-            ctx.beginPath(); ctx.arc(17, -45 - wave, 4, 0, Math.PI * 2); ctx.fill();
-            // head
+            if (!fleeing) {
+                ctx.fillStyle = '#e8b98c';
+                ctx.beginPath(); ctx.arc(17, -45 - wave, 4, 0, Math.PI * 2); ctx.fill();
+            }
             ctx.fillStyle = '#f0c49a';
             ctx.beginPath(); ctx.arc(0, -50, 8.5, 0, Math.PI * 2); ctx.fill();
-            // angry red face when ranting
             if (ranting) {
                 ctx.fillStyle = 'rgba(220,60,50,0.45)';
                 ctx.beginPath(); ctx.arc(0, -50, 8.5, 0, Math.PI * 2); ctx.fill();
             }
-            // angry brows + eyes + shouting mouth
             ctx.strokeStyle = '#3a2a1a'; ctx.lineWidth = 2;
-            ctx.beginPath(); ctx.moveTo(-6, -54); ctx.lineTo(-1, -52); ctx.moveTo(6, -54); ctx.lineTo(1, -52); ctx.stroke();
+            ctx.beginPath();
+            if (fleeing) {
+                // eyebrows shoot up instead of down -- pure terror
+                ctx.moveTo(-6, -55); ctx.lineTo(-1, -57); ctx.moveTo(6, -55); ctx.lineTo(1, -57);
+            } else {
+                ctx.moveTo(-6, -54); ctx.lineTo(-1, -52); ctx.moveTo(6, -54); ctx.lineTo(1, -52);
+            }
+            ctx.stroke();
             ctx.fillStyle = '#000';
-            ctx.beginPath(); ctx.arc(-3, -50, 1.4, 0, Math.PI * 2); ctx.fill();
-            ctx.beginPath(); ctx.arc(3, -50, 1.4, 0, Math.PI * 2); ctx.fill();
+            if (fleeing) {
+                ctx.beginPath(); ctx.arc(-3, -50, 2.4, 0, Math.PI * 2); ctx.fill();
+                ctx.beginPath(); ctx.arc(3, -50, 2.4, 0, Math.PI * 2); ctx.fill();
+            } else {
+                ctx.beginPath(); ctx.arc(-3, -50, 1.4, 0, Math.PI * 2); ctx.fill();
+                ctx.beginPath(); ctx.arc(3, -50, 1.4, 0, Math.PI * 2); ctx.fill();
+            }
             ctx.fillStyle = '#6b2020';
             if (ranting) { ctx.beginPath(); ctx.ellipse(0, -45, 3.5, 2.5 + Math.abs(Math.sin(frameCount * 0.3)) * 1.5, 0, 0, Math.PI * 2); ctx.fill(); }
+            else if (fleeing) { ctx.beginPath(); ctx.ellipse(0, -44, 4, 4.5, 0, 0, Math.PI * 2); ctx.fill(); }
             else ctx.fillRect(-3, -46, 6, 1.6);
-            // straw hat
+            // the hat flies off when he bolts
             ctx.fillStyle = '#d9b451';
-            ctx.beginPath(); ctx.ellipse(0, -57, 15, 4, 0, 0, Math.PI * 2); ctx.fill();
-            ctx.beginPath(); ctx.ellipse(0, -61, 7.5, 6, 0, 0, Math.PI * 2); ctx.fill();
+            if (fleeing) {
+                ctx.save();
+                ctx.translate(-16 - this.walkCycle % 6, -74);
+                ctx.rotate(this.walkCycle);
+                ctx.beginPath(); ctx.ellipse(0, 0, 14, 4, 0, 0, Math.PI * 2); ctx.fill();
+                ctx.restore();
+            } else {
+                ctx.beginPath(); ctx.ellipse(0, -57, 15, 4, 0, 0, Math.PI * 2); ctx.fill();
+                ctx.beginPath(); ctx.ellipse(0, -61, 7.5, 6, 0, 0, Math.PI * 2); ctx.fill();
+            }
             ctx.restore();
-            // shouting marks
             if (ranting && Math.floor(frameCount / 12) % 2 === 0) {
                 ctx.fillStyle = '#fff2a8';
                 ctx.font = 'bold 16px "Courier New", monospace';
                 ctx.fillText('!', this.x + 22 * this.facingDir, this.y - 62);
             }
-        }
-    }
-
-    class RainCloud {
-        constructor() {
-            this.dir = Math.random() > 0.5 ? 1 : -1;
-            this.x = this.dir === 1 ? -80 : canvas.width + 80;
-            this.y = playArea.minY + 40 + Math.random() * (playArea.maxY - playArea.minY - 70);
-            this.stopX = playArea.minX + 100 + Math.random() * (playArea.maxX - playArea.minX - 200);
-            this.z = 95;               // floats above the field
-            this.speed = 1.6;
-            this.state = 'arrive';
-            this.rain = 60 * 4;
-            this.drops = [];
-            this.dropped = false;
-            this.active = true;
-        }
-        update() {
-            if (this.state === 'arrive') {
-                let dx = this.stopX - this.x;
-                if (Math.abs(dx) < 6) this.state = 'rain';
-                else this.x += Math.sign(dx) * this.speed;
-            } else if (this.state === 'rain') {
-                if (frameCount % 2 === 0) {
-                    this.drops.push({ x: (Math.random() - 0.5) * 54, y: 0, v: 3 + Math.random() * 2 });
+            if (fleeing) {
+                // sweat drops flying off
+                ctx.fillStyle = '#9ad8ff';
+                for (let i = 0; i < 3; i++) {
+                    let f = (frameCount * 0.16 + i * 2.1) % 6.283;
+                    ctx.beginPath();
+                    ctx.arc(this.x + this.dir * (14 + Math.sin(f) * 10), this.y - 62 - Math.cos(f) * 8, 2.2, 0, Math.PI * 2);
+                    ctx.fill();
                 }
-                if (--this.rain <= 0) this.state = 'leave';   // just weather now
-            } else {
-                this.x += this.dir * this.speed;
-                if (this.x < -140 || this.x > canvas.width + 140) this.active = false;
             }
-            for (let d of this.drops) d.y += d.v;
-            this.drops = this.drops.filter(d => d.y < this.z);
-        }
-        draw() {
-            ctx.save();
-            // rain
-            ctx.strokeStyle = 'rgba(150,190,225,0.75)'; ctx.lineWidth = 2;
-            ctx.beginPath();
-            for (let d of this.drops) {
-                ctx.moveTo(this.x + d.x, this.y - this.z + d.y);
-                ctx.lineTo(this.x + d.x, this.y - this.z + d.y + 6);
-            }
-            ctx.stroke();
-            // little grey cloud, about horse-sized
-            ctx.translate(this.x, this.y - this.z);
-            ctx.fillStyle = '#7d8894';
-            ctx.beginPath();
-            ctx.arc(-20, 0, 15, 0, Math.PI * 2);
-            ctx.arc(0, -6, 20, 0, Math.PI * 2);
-            ctx.arc(22, 0, 15, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.fillStyle = '#6b747f';
-            ctx.beginPath();
-            ctx.arc(-16, 6, 11, 0, Math.PI * 2);
-            ctx.arc(4, 8, 13, 0, Math.PI * 2);
-            ctx.arc(20, 5, 10, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.restore();
         }
     }
 
-    // Everything a hen should think twice about walking into.
+    // Everything a hen should think twice about walking into. Rebuilt at most
+    // once a frame -- with hundreds of birds asking, allocating a fresh array
+    // for each of them was the single most expensive thing in the game.
+    let _zones = [], _zonesFrame = -1;
     function killZones() {
-        let z = [];
-        // `a` is how strongly to draw the warning ring, so it fades in and out
-        // with the hazard instead of popping on.
-        for (let w of wolves) if (w.state !== 'leave') z.push({ x: w.x, y: w.y, kill: w.killR, scare: w.scareR, kind: 'WOLF!', a: 1 });
-        for (let g of gators) if (g.emerge > 0.4) z.push({ x: g.x, y: g.y, kill: g.killR, scare: g.scareR, kind: 'GATOR!', a: Math.min(1, (g.emerge - 0.4) / 0.3) });
-        for (let f of farmers) if (f.state === 'rant') z.push({ x: f.x, y: f.y, kill: f.killR, scare: f.scareR, kind: 'FARMER!', a: 1 });
-        return z;
+        if (_zonesFrame === frameCount) return _zones;
+        _zonesFrame = frameCount;
+        _zones.length = 0;
+        for (let p of predators) {
+            if (p.scared || p.hasChicken) continue;   // on its way out, harmless
+            _zones.push({ x: p.x, y: p.y, kill: p.grabR, scare: p.scareR, kind: p.label, a: 1 });
+        }
+        return _zones;
     }
 
-    // One roaming hazard at a time, so the yard never becomes unplayable.
-    function spawnRoamingHazard() {
-        let roll = Math.random();
-        if (roll < 0.4) {
-            wolves.push(new Wolf());
-            showBanner('A WOLF!', '#ff5a5a');
-            sndGrowl();
-        } else if (roll < 0.7) {
-            gators.push(new Gator());
-            showBanner('ALLIGATOR!', '#8aff6b');
-            sndGrowl();
-        } else {
-            farmers.push(new Farmer());
-            showBanner('ANGRY FARMER!', '#ffbe50');
-            sndDud();
+    // A wave of hungry things. They come more often, and in bigger numbers,
+    // the more chickens there are to come for.
+    function spawnPredatorWave() {
+        if (predators.length >= PRED_MAX) return;
+        let n = 1 + Math.min(2, (chickens.length / 110) | 0);
+        let kinds = [];
+        for (let i = 0; i < n && predators.length + kinds.length < PRED_MAX; i++) {
+            let roll = Math.random(), side = i % 2 === 0 ? -1 : 1;
+            if (roll < 0.46) kinds.push(new Fox(side));
+            else if (roll < 0.74) kinds.push(new Wolf(side));
+            else if (roll < 0.93) kinds.push(new Gator(side));
+            else kinds.push(new Bear(side));
+        }
+        for (let k of kinds) predators.push(k);
+        if (kinds.length) {
+            showBanner(kinds.length > 1 ? kinds.length + ' PREDATORS!' : kinds[0].label, '#ff8080');
+            if (kinds.some(k => k.kind === 'fox')) sndYip(); else sndGrowl();
         }
     }
 
-    // Is this spot a bad place to put corn? Used by the aiming reticle.
+    // Is this spot a bad place to be standing?
     function spotDanger(x, y) {
-        // Margins allow for the corn scattering after it lands, so a "safe"
-        // reticle really is safe.
-        for (let z of killZones()) if (dist(x, y, z.x, z.y) < z.kill + 78) return z.kind;
+        for (let z of killZones()) if (dist(x, y, z.x, z.y) < z.kill + 70) return z.kind;
         return null;
     }
 
@@ -2861,128 +3031,95 @@
         }
     }
 
-    // P key: call down a bolt. Foxes bolt for the exit and go home hungry.
+    // Little ghost chickens, for the ones that stood in the wrong place
+    let angels = [];
+    let scorches = [];
+
+    // ZAP. Something was standing right there.
+    function vaporise(c) {
+        c.dead = true;
+        chickensVaporised++;
+        releaseJob(c);
+        featherBurst(c.x, c.y);
+        for (let i = 0; i < 10; i++) {
+            particles.push(new Particle(c.x, c.y, {
+                z: 4, vx: (Math.random() - 0.5) * 1.6, vy: (Math.random() - 0.5) * 0.8,
+                vz: 1.1 + Math.random() * 1.5, gravity: -0.012, life: 60,
+                color: '#cfcfcf', size: 5
+            }));
+        }
+        angels.push({ x: c.x, y: c.y, z: 2, life: 130, wob: Math.random() * 6 });
+    }
+
+    function drawAngels() {
+        for (let a of angels) {
+            let t = a.life / 130;
+            ctx.save();
+            ctx.globalAlpha = Math.min(1, t * 1.6);
+            ctx.translate(a.x + Math.sin(a.wob) * 6, a.y - a.z);
+            // tiny wings
+            ctx.fillStyle = '#ffffff';
+            let f = Math.sin(a.wob * 3) * 3;
+            ctx.beginPath(); ctx.moveTo(-4, -2); ctx.lineTo(-13, -8 - f); ctx.lineTo(-4, 3); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(4, -2); ctx.lineTo(13, -8 - f); ctx.lineTo(4, 3); ctx.fill();
+            // ghost hen
+            ctx.beginPath(); ctx.moveTo(8, 0); ctx.lineTo(-7, -6); ctx.lineTo(-5, 4); ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#ffa500';
+            ctx.beginPath(); ctx.moveTo(7, -1); ctx.lineTo(12, 1); ctx.lineTo(7, 3); ctx.fill();
+            ctx.fillStyle = '#000'; ctx.fillRect(3, -2, 1.6, 1.6);
+            // halo
+            ctx.strokeStyle = '#ffe14d'; ctx.lineWidth = 1.6;
+            ctx.beginPath(); ctx.ellipse(0, -12, 7, 2.6, 0, 0, Math.PI * 2); ctx.stroke();
+            ctx.restore();
+        }
+        ctx.globalAlpha = 1;
+    }
+
+    function drawScorches() {
+        for (let sc of scorches) {
+            ctx.globalAlpha = Math.min(0.5, sc.life / 200);
+            ctx.fillStyle = '#3a2f22';
+            ctx.beginPath(); ctx.ellipse(sc.x, sc.y, 26, 10, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.globalAlpha = 1;
+        }
+    }
+
+    // The bolt. It scares off EVERY predator on the farm -- but you cannot
+    // aim the weather, and anything standing under it gets vaporised.
     function strikeLightning() {
         if (boltCd > 0) return false;
         boltCd = BOLT_COOLDOWN;
 
-        // Aim at a fox if there is one, otherwise just put on a show
-        let target = foxes.length > 0 ? foxes[0] : null;
-        let sx = target ? target.x : playArea.minX + Math.random() * (playArea.maxX - playArea.minX);
-        let sy = target ? target.y : playArea.minY + Math.random() * (playArea.maxY - playArea.minY);
+        let sx = playArea.minX + Math.random() * (playArea.maxX - playArea.minX);
+        let sy = playArea.minY + Math.random() * (playArea.maxY - playArea.minY);
 
         bolts.push(new Lightning(sx, sy));
         sndThunder();
         flash = 1;
-        puff(sx, sy, 16, '#e8e4c8', 3.0);
+        puff(sx, sy, 18, '#e8e4c8', 3.2);
+        scorches.push({ x: sx, y: sy, life: 60 * 7 });
 
-        // The whole thunderclap rolls across the farm. EVERY animal on the
-        // field turns tail -- foxes, the wolf, the gator, the farmer and the
-        // bear. This is the player's big moment.
-        for (let f of foxes) {
-            if (!f.scared) { f.scare(); foxesZapped++; addScore(100); }
+        // Everything with teeth turns tail, wherever it happens to be standing
+        for (let p of predators) if (!p.scared) { p.scare(); foxesZapped++; addScore(100); }
+        for (let f of farmers) if (!f.scared) f.scare();
+
+        // ...and whoever was standing on the spot. Oops.
+        let zapped = 0;
+        for (let c of nearHens(sx, sy)) {
+            if (!huntable(c) || c.hidden) continue;
+            if (dist(c.x, c.y, sx, sy) < BOLT_ZAP_R) { vaporise(c); zapped++; }
         }
-        for (let list of [wolves, gators, farmers, bears]) {
-            for (let a of list) {
-                if (a.scare && !a.scared) { a.scare(); foxesZapped++; addScore(100); }
-            }
+        if (zapped > 0) {
+            showBanner(zapped === 1 ? 'OOPS! ZAPPED A CHICKEN!' : 'OOPS! ZAPPED ' + zapped + ' CHICKENS!', '#ffd0a0');
         }
-        // Everyone else jumps out of their skin too
-        for (let c of chickens) {
-            if (c.z === 0 && c.vz === 0 && c.flutterCd <= 0 && dist(c.x, c.y, sx, sy) < 260) c.flutter(sx, sy);
+
+        // Everyone else jumps out of their skin
+        for (let c of nearHens(sx, sy)) {
+            if (c.dead || c.hidden) continue;
+            if (c.z === 0 && c.vz === 0 && c.flutterCd <= 0 && dist(c.x, c.y, sx, sy) < 200) c.flutter(sx, sy);
         }
         for (let h of horses) h.spook(sx, sy);
         return true;
-    }
-
-    class Bear {
-        constructor() {
-            this.dir = Math.random() > 0.5 ? 1 : -1;
-            this.x = this.dir === 1 ? -110 : canvas.width + 110;
-            this.y = playArea.minY + 30 + Math.random() * (playArea.maxY - playArea.minY - 30);
-            this.baseY = this.y;
-            this.speed = 2.6 + Math.random() * 1.2;
-            this.facingDir = this.dir;
-            this.walkCycle = 0;
-            this.dustCd = 0;
-            this.calledExodus = false;
-            this.scared = false;
-            this.active = true;
-        }
-        // Zapped -- the bear legs it the way it came
-        scare() {
-            if (this.scared) return;
-            this.scared = true;
-            this.dir = -this.dir;
-            this.facingDir = this.dir;
-            this.speed = 6;
-            puff(this.x, this.y, 10, '#8a7a68', 2.4);
-        }
-        update() {
-            // Once it's properly on the field, the crazy ones go with it
-            if (!this.calledExodus && !this.scared &&
-                ((this.dir === 1 && this.x > canvas.width * 0.3) ||
-                 (this.dir === -1 && this.x < canvas.width * 0.7))) {
-                this.calledExodus = true;
-                let crazies = chickens.filter(c => c.crazy && c.state !== 'exodus');
-                if (crazies.length > 0) {
-                    showBanner('THE CRAZY ONES LEAVE!', '#ff6bcb',
-                        'The crazy chickens are flying away with the bear! Bye bye!');
-                    crazies.forEach(c => c.startExodus(this.dir));
-                }
-            }
-            this.x += this.speed * this.dir;
-            // lazy weave so it isn't a straight line
-            this.y = clampY(this.baseY + Math.sin(this.x * 0.012) * 18);
-            this.walkCycle += 0.26;
-            if (--this.dustCd <= 0) {
-                this.dustCd = 6;
-                puff(this.x - 20 * this.dir, this.y + 4, 2, '#8f9c6a', 1.0);
-            }
-            if ((this.dir === 1 && this.x > canvas.width + 130) ||
-                (this.dir === -1 && this.x < -130)) this.active = false;
-        }
-        draw() {
-            drawShadow(this.x, this.y, 32, 12);
-            ctx.save();
-            ctx.translate(this.x, this.y);
-            ctx.scale(this.facingDir, 1);
-            // lumbering bound
-            ctx.translate(0, -Math.abs(Math.sin(this.walkCycle)) * 5);
-
-            let front = Math.sin(this.walkCycle) * 11;
-            let back = Math.sin(this.walkCycle + 2.4) * 11;
-
-            // Legs
-            ctx.strokeStyle = '#3a2416'; ctx.lineWidth = 7; ctx.lineCap = 'round';
-            ctx.beginPath();
-            ctx.moveTo(-16, 0); ctx.lineTo(-16 + back, 18);
-            ctx.moveTo(-6, 0); ctx.lineTo(-6 + back * 0.8, 18);
-            ctx.moveTo(12, 0); ctx.lineTo(12 + front * 0.8, 18);
-            ctx.moveTo(21, 0); ctx.lineTo(21 + front, 18);
-            ctx.stroke();
-            ctx.lineCap = 'butt';
-
-            // Body with a shoulder hump
-            ctx.fillStyle = '#4a2f1c';
-            ctx.beginPath(); ctx.ellipse(0, -10, 27, 15, 0, 0, Math.PI * 2); ctx.fill();
-            ctx.beginPath(); ctx.ellipse(8, -20, 13, 9, 0, 0, Math.PI * 2); ctx.fill();
-
-            // Head
-            ctx.beginPath(); ctx.ellipse(28, -18, 13, 11, 0, 0, Math.PI * 2); ctx.fill();
-            // Ears
-            ctx.beginPath(); ctx.arc(23, -28, 5, 0, Math.PI * 2); ctx.fill();
-            ctx.beginPath(); ctx.arc(34, -27, 5, 0, Math.PI * 2); ctx.fill();
-            // Muzzle
-            ctx.fillStyle = '#8a6a4a';
-            ctx.beginPath(); ctx.ellipse(38, -14, 8, 6, 0, 0, Math.PI * 2); ctx.fill();
-            ctx.fillStyle = '#1a1008';
-            ctx.beginPath(); ctx.arc(44, -15, 3, 0, Math.PI * 2); ctx.fill();
-            // Eye
-            ctx.fillRect(30, -22, 3, 3);
-
-            ctx.restore();
-        }
     }
 
     class SkyBird {
@@ -3034,21 +3171,850 @@
         }
     }
 
-    // The fox is an opportunist: it goes for the fattest, slowest bird out there.
-    function pickPrey(forFox) {
-        // Prefer the fattest bird nobody else is already hunting, so a whole
-        // wave of foxes threatens several chickens instead of ganging up on one.
-        let taken = new Set();
-        for (let f of foxes) {
-            if (f !== forFox && f.targetChicken && !f.targetChicken.dead) taken.add(f.targetChicken);
+    // Whoever is nearest and not already being chased by somebody else.
+    // With hundreds of birds we sample rather than scan the lot every frame.
+    function pickPrey(forWho) {
+        let n = chickens.length;
+        if (n === 0) return null;
+        let taken = null;
+        if (predators.length > 1) {
+            taken = new Set();
+            for (let p of predators) if (p !== forWho && p.targetChicken) taken.add(p.targetChicken);
         }
-        let best = null, bestFree = null;
-        for (let c of chickens) {
-            if (c.dead || c.state === 'exodus' || c.state === 'toCoop') continue;
-            if (!best || c.fatness > best.fatness) best = c;
-            if (!taken.has(c) && (!bestFree || c.fatness > bestFree.fatness)) bestFree = c;
+        let best = null, bestD = Infinity, fallback = null;
+        let tries = Math.min(n, 70);
+        for (let i = 0; i < tries; i++) {
+            let c = chickens[(Math.random() * n) | 0];
+            if (!huntable(c)) continue;
+            if (!fallback) fallback = c;
+            if (taken && taken.has(c)) continue;
+            let d = dist(forWho.x, forWho.y, c.x, c.y);
+            if (d < bestD) { bestD = d; best = c; }
         }
-        return bestFree || best;
+        return best || fallback;
+    }
+
+    // ============================================================
+    //  THE FLOCK GETS IDEAS
+    //  Once there are enough chickens they stop just milling about and
+    //  start BUILDING things. Hard hats, tools, scaffolding, the lot.
+    //  Every project needs a bigger flock than the last one.
+    // ============================================================
+
+    let projects = [];
+    let guards = [];
+    let guardsAnnounced = false;
+    let ball = null;
+    let plane = null;
+
+    const GUARD_AT = 110, GUARD_COUNT = 5;
+    const BALL_AT = 100, BALL_SQUAD = 8;
+
+    const PROJECT_SPECS = [
+        { key: 'coop',   need: 20,  x: 148,  y: 336, w: 78,  h: 108, crew: 4, work: 60 * 78,  name: 'HEN HOUSE' },
+        { key: 'fire',   need: 40,  x: 1122, y: 470, w: 34,  h: 34,  crew: 3, work: 60 * 34,  name: 'CAMPFIRE'  },
+        { key: 'barn',   need: 70,  x: 432,  y: 320, w: 104, h: 132, crew: 6, work: 60 * 150, name: 'BARN'      },
+        { key: 'castle', need: 150, x: 752,  y: 372, w: 130, h: 132, crew: 8, work: 60 * 230, name: 'CASTLE'    },
+        { key: 'plane',  need: 200, x: 640,  y: 660, w: 86,  h: 52,  crew: 6, work: 60 * 140, name: 'AEROPLANE' },
+    ];
+
+    // "a barn" but "an aeroplane"
+    function article(name) { return 'AEIOU'.includes(name[0]) ? 'AN ' : 'A '; }
+
+    // Let a chicken go back to being an ordinary chicken.
+    function releaseJob(c) {
+        if (!c || !c.job) return;
+        let st = c.site;
+        if (st) {
+            for (let list of [st.crew, st.residents, st.patrol, st.sitters]) {
+                let i = list.indexOf(c);
+                if (i >= 0) list.splice(i, 1);
+            }
+        }
+        let g = guards.indexOf(c); if (g >= 0) guards.splice(g, 1);
+        c.job = null; c.site = null;
+        c.hidden = false; c.safe = false;
+        c.sitting = false; c.atPost = false;
+        if (c.state !== 'exodus' && c.state !== 'toCoop') c.state = 'wander';
+    }
+
+    // --- Little chickens drawn by a building rather than by the flock ---
+    function drawMiniChicken(x, y, s, dir, cycle, color) {
+        ctx.save();
+        ctx.translate(x, y - Math.abs(Math.sin(cycle)) * 1.8);
+        ctx.scale(dir, 1);
+        ctx.strokeStyle = '#ffa500'; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.2, s * 0.3); ctx.lineTo(-s * 0.2 + Math.sin(cycle) * s * 0.35, s * 0.85);
+        ctx.moveTo(s * 0.2, s * 0.3);  ctx.lineTo(s * 0.2 - Math.sin(cycle) * s * 0.35, s * 0.85);
+        ctx.stroke();
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(s, 0); ctx.lineTo(-s * 0.8, -s * 0.7); ctx.lineTo(-s * 0.6, s * 0.5);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#ffa500';
+        ctx.beginPath(); ctx.moveTo(s - 1, -1); ctx.lineTo(s + s * 0.45, 1); ctx.lineTo(s - 1, 3); ctx.fill();
+        ctx.fillStyle = '#cc0000';
+        ctx.beginPath();
+        ctx.moveTo(s - s * 0.6, -s * 0.4); ctx.lineTo(s - s * 0.35, -s * 0.8); ctx.lineTo(s - s * 0.05, -s * 0.3);
+        ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.fillRect(s - s * 0.5, -s * 0.22, 1.6, 1.6);
+        ctx.restore();
+    }
+
+    // --- Site kit, drawn inside the chicken's own flipped transform ---
+    function drawHardHat(s) {
+        ctx.fillStyle = '#ffcc33';
+        ctx.beginPath(); ctx.arc(s * 0.3, -s * 0.6, s * 0.42, Math.PI, 0); ctx.fill();
+        ctx.fillRect(s * 0.3 - s * 0.6, -s * 0.64, s * 1.2, s * 0.15);
+        ctx.fillStyle = '#e0a800';
+        ctx.fillRect(s * 0.26, -s * 1.0, s * 0.09, s * 0.4);
+    }
+    function drawHelmet(s) {
+        ctx.fillStyle = '#9aa4ae';
+        ctx.beginPath(); ctx.arc(s * 0.3, -s * 0.58, s * 0.4, Math.PI, 0); ctx.fill();
+        ctx.fillRect(s * 0.3 - s * 0.52, -s * 0.62, s * 1.04, s * 0.13);
+        ctx.fillStyle = '#cc2222';
+        ctx.fillRect(s * 0.25, -s * 1.06, s * 0.1, s * 0.46);
+    }
+    function drawTool(kind, s) {
+        let u = s * 0.11;
+        if (kind === 0) {                     // hammer
+            ctx.strokeStyle = '#a9743d'; ctx.lineWidth = u * 1.4;
+            ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -u * 7); ctx.stroke();
+            ctx.fillStyle = '#9aa4ae'; ctx.fillRect(-u * 2.4, -u * 9.6, u * 4.8, u * 2.6);
+        } else if (kind === 1) {              // handsaw
+            ctx.strokeStyle = '#a9743d'; ctx.lineWidth = u * 1.4;
+            ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -u * 3); ctx.stroke();
+            ctx.fillStyle = '#c8d0d8';
+            ctx.beginPath(); ctx.moveTo(-u, -u * 3); ctx.lineTo(u * 1.3, -u * 3);
+            ctx.lineTo(u * 1.3, -u * 10); ctx.closePath(); ctx.fill();
+        } else if (kind === 2) {              // a plank over the shoulder
+            ctx.fillStyle = '#c69b5f'; ctx.fillRect(-u * 8, -u * 2.4, u * 16, u * 2.6);
+            ctx.strokeStyle = '#a9743d'; ctx.lineWidth = 1;
+            ctx.strokeRect(-u * 8, -u * 2.4, u * 16, u * 2.6);
+        } else if (kind === 3) {              // paint roller
+            ctx.strokeStyle = '#8a8a8a'; ctx.lineWidth = u * 1.2;
+            ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -u * 6); ctx.lineTo(u * 3, -u * 6); ctx.stroke();
+            ctx.fillStyle = '#e85a4a'; ctx.fillRect(u * 2, -u * 8.6, u * 2.4, u * 4.6);
+        } else {                              // enormous spanner
+            ctx.strokeStyle = '#9aa4ae'; ctx.lineWidth = u * 1.8;
+            ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -u * 7); ctx.stroke();
+            ctx.lineWidth = u * 1.1;
+            ctx.beginPath(); ctx.arc(0, -u * 8.4, u * 1.9, 0.6, 5.7); ctx.stroke();
+        }
+    }
+    function drawPitchfork(s) {
+        let u = s * 0.13;
+        ctx.strokeStyle = '#a9743d'; ctx.lineWidth = u * 1.2;
+        ctx.beginPath(); ctx.moveTo(0, u * 4); ctx.lineTo(0, -u * 9); ctx.stroke();
+        ctx.strokeStyle = '#c8d0d8'; ctx.lineWidth = u * 0.9;
+        ctx.beginPath();
+        ctx.moveTo(-u * 2.4, -u * 13); ctx.lineTo(-u * 2.4, -u * 9);
+        ctx.moveTo(0, -u * 13.8); ctx.lineTo(0, -u * 9);
+        ctx.moveTo(u * 2.4, -u * 13); ctx.lineTo(u * 2.4, -u * 9);
+        ctx.moveTo(-u * 2.4, -u * 9.4); ctx.lineTo(u * 2.4, -u * 9.4);
+        ctx.stroke();
+    }
+    function drawMarshmallow(s) {
+        ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(s * 0.3, -s * 0.1); ctx.lineTo(s * 1.6, -s * 0.55); ctx.stroke();
+        ctx.fillStyle = '#fff4e0';
+        ctx.beginPath(); ctx.arc(s * 1.7, -s * 0.6, s * 0.25, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // A properly flickery campfire, drawn in three layers
+    function drawFlame(x, y, s, t) {
+        ctx.globalAlpha = 0.2 + Math.sin(t * 0.21) * 0.06;
+        ctx.fillStyle = '#ff9b3b';
+        ctx.beginPath(); ctx.ellipse(x, y, 58 * s, 22 * s, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1;
+        const L = [['#c8380f', 1.0], ['#ff7b1c', 0.7], ['#ffd23b', 0.4]];
+        for (let i = 0; i < L.length; i++) {
+            let h = (34 + Math.sin(t * 0.33 + i * 1.7) * 7) * s * L[i][1];
+            let w = 15 * s * L[i][1];
+            let lean = Math.sin(t * 0.19 + i) * 5 * s;
+            ctx.fillStyle = L[i][0];
+            ctx.beginPath();
+            ctx.moveTo(x - w, y);
+            ctx.quadraticCurveTo(x - w * 0.7, y - h * 0.55, x + lean, y - h);
+            ctx.quadraticCurveTo(x + w * 0.7, y - h * 0.55, x + w, y);
+            ctx.closePath(); ctx.fill();
+        }
+    }
+
+    class Project {
+        constructor(spec) {
+            this.spec = spec; this.key = spec.key;
+            this.x = spec.x; this.y = spec.y;
+            this.work = 0;
+            this.done = false;
+            this.crew = []; this.residents = []; this.patrol = []; this.sitters = [];
+            this.pop = 0;
+            this.crane = Math.random() * 6;
+        }
+        get t() { return Math.min(1, this.work / this.spec.work); }
+
+        // Where a worker (or a campfire sitter) should stand
+        slotPos(i, sitting) {
+            let n = sitting ? 6 : this.spec.crew;
+            let a = (i / n) * Math.PI * 2 + (sitting ? 0.5 : 0.2);
+            let rx = sitting ? 56 : this.spec.w + 26;
+            let ry = sitting ? 24 : this.spec.h * 0.22 + 18;
+            return { x: clampX(this.x + Math.cos(a) * rx), y: clampY(this.y + 16 + Math.sin(a) * ry) };
+        }
+
+        // Keep a named crew list topped up from whoever is free
+        staff(list, job, max) {
+            for (let i = list.length - 1; i >= 0; i--) {
+                let c = list[i];
+                if (c.dead || c.site !== this || c.job !== job) list.splice(i, 1);
+            }
+            if (list.length < max && frameCount % 10 === 0) {
+                let n = chickens.length;
+                for (let i = 0; i < 45 && list.length < max; i++) {
+                    let c = chickens[(Math.random() * n) | 0];
+                    if (!idleHen(c)) continue;
+                    c.job = job; c.site = this;
+                    c.releaseFood();
+                    if (job === 'build') { c.tool = (Math.random() * 5) | 0; c.workCycle = Math.random() * 6; }
+                    // indoors means out of reach of anything with teeth
+                    if (job === 'inside' || job === 'patrol') {
+                        c.hidden = true; c.safe = true;
+                        c.x = this.x; c.y = this.y - 2;   // they live here now
+                    }
+                    list.push(c);
+                    puff(c.x, c.y - 14, 3, job === 'build' ? '#ffcc33' : '#ffffff', 1.1);
+                }
+            }
+            for (let i = 0; i < list.length; i++) list[i].slot = i;
+        }
+
+        update() {
+            if (this.pop > 0) this.pop--;
+            if (!this.done) {
+                this.staff(this.crew, 'build', this.spec.crew);
+                let onSite = 0;
+                for (let c of this.crew) if (c.atPost) onSite++;
+                this.work += onSite;
+                this.crane += 0.02;
+                if (onSite > 0 && frameCount % 16 === 0) {
+                    let a = Math.random() * Math.PI * 2;
+                    puff(this.x + Math.cos(a) * this.spec.w * 0.8,
+                         this.y + Math.sin(a) * 8, 2, '#ded0b4', 1.3);
+                }
+                if (this.work >= this.spec.work) this.finish();
+            } else {
+                if (this.key === 'barn') this.staff(this.residents, 'inside', 8);
+                else if (this.key === 'castle') {
+                    this.staff(this.patrol, 'patrol', 6);
+                    this.staff(this.residents, 'inside', 10);
+                } else if (this.key === 'fire') this.staff(this.sitters, 'sit', 6);
+                // sparks off the fire
+                if (this.key === 'fire' && frameCount % 9 === 0) {
+                    particles.push(new Particle(this.x + (Math.random() - 0.5) * 16, this.y - 6, {
+                        z: 8, vx: (Math.random() - 0.5) * 0.5, vy: -0.1,
+                        vz: 1.4 + Math.random(), gravity: -0.02, life: 45,
+                        color: Math.random() > 0.5 ? '#ffd23b' : '#ff7b1c', size: 2
+                    }));
+                }
+            }
+        }
+
+        finish() {
+            this.done = true;
+            this.pop = 70;
+            for (let c of this.crew.slice()) releaseJob(c);
+            this.crew.length = 0;
+            showBanner('THEY BUILT ' + article(this.spec.name) + this.spec.name + '!', '#ffd23b');
+            sndFanfare();
+            addScore(500);
+            spawnConfetti(45);
+            puff(this.x, this.y, 26, '#fff2c8', 3.4);
+            if (this.key === 'plane') plane = new Plane(this.x, this.y - 10);
+        }
+
+        // ---------------- drawing ----------------
+        draw() {
+            let sp = this.spec;
+            if (!this.done) {
+                let t = this.t;
+                // the building rises out of the ground as the work goes in
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(this.x - sp.w - 40, this.y - sp.h * t, (sp.w + 40) * 2, sp.h * t + 34);
+                ctx.clip();
+                this.drawBuilding();
+                ctx.restore();
+                this.drawScaffold(t);
+                this.drawSign(t);
+            } else {
+                this.drawBuilding();
+                this.drawLife();
+                if (this.pop > 0) {
+                    let a = this.pop / 70;
+                    ctx.globalAlpha = a;
+                    ctx.strokeStyle = '#ffe14d'; ctx.lineWidth = 3;
+                    ctx.beginPath();
+                    ctx.ellipse(this.x, this.y, (1 - a) * 160 + 30, ((1 - a) * 160 + 30) * 0.4, 0, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.globalAlpha = 1;
+                }
+            }
+        }
+
+        // Poles, planks, a swinging load on a rope and some hazard tape
+        drawScaffold(t) {
+            let sp = this.spec, top = this.y - sp.h * t - 16;
+            ctx.strokeStyle = '#b98b4e'; ctx.lineWidth = 3;
+            for (let sgn = -1; sgn <= 1; sgn += 2) {
+                let px = this.x + sgn * (sp.w + 12);
+                ctx.beginPath(); ctx.moveTo(px, this.y + 6); ctx.lineTo(px, top); ctx.stroke();
+            }
+            ctx.lineWidth = 2;
+            for (let yy = this.y - 14; yy > top; yy -= 28) {
+                ctx.beginPath();
+                ctx.moveTo(this.x - sp.w - 12, yy); ctx.lineTo(this.x + sp.w + 12, yy);
+                ctx.stroke();
+                // a diagonal brace, for the look of the thing
+                ctx.strokeStyle = 'rgba(185,139,78,0.55)';
+                ctx.beginPath();
+                ctx.moveTo(this.x - sp.w - 12, yy); ctx.lineTo(this.x + sp.w + 12, yy - 28);
+                ctx.stroke();
+                ctx.strokeStyle = '#b98b4e';
+            }
+            // crane arm with a plank swinging off a rope
+            let sway = Math.sin(this.crane) * 22;
+            ctx.strokeStyle = '#8a94a0'; ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(this.x - sp.w - 30, this.y + 6);
+            ctx.lineTo(this.x - sp.w - 30, top - 34);
+            ctx.lineTo(this.x - sp.w * 0.1, top - 34);
+            ctx.stroke();
+            ctx.strokeStyle = '#e8e0c8'; ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(this.x - sp.w * 0.1, top - 34);
+            ctx.lineTo(this.x - sp.w * 0.1 + sway, top - 6);
+            ctx.stroke();
+            ctx.fillStyle = '#c69b5f';
+            ctx.save();
+            ctx.translate(this.x - sp.w * 0.1 + sway, top - 4);
+            ctx.rotate(Math.cos(this.crane) * 0.16);
+            ctx.fillRect(-17, -3, 34, 6);
+            ctx.restore();
+            // hazard tape across the front
+            ctx.lineWidth = 3;
+            for (let i = 0; i < 9; i++) {
+                ctx.strokeStyle = i % 2 ? '#1a1a1a' : '#ffd23b';
+                let x0 = this.x - sp.w - 12 + (i * (sp.w + 12) * 2) / 9;
+                ctx.beginPath();
+                ctx.moveTo(x0, this.y + 8);
+                ctx.lineTo(x0 + (sp.w + 12) * 2 / 9, this.y + 4);
+                ctx.stroke();
+            }
+        }
+
+        drawSign(t) {
+            let sx = this.x + this.spec.w + 40, sy = this.y - 6;
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx, sy - 30); ctx.stroke();
+            ctx.fillStyle = '#f4ede0'; ctx.fillRect(sx - 44, sy - 58, 88, 30);
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 2;
+            ctx.strokeRect(sx - 44, sy - 58, 88, 30);
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#7a4a20';
+            ctx.font = 'bold 9px "Courier New", monospace';
+            ctx.fillText(this.spec.name, sx, sy - 47);
+            ctx.fillStyle = 'rgba(0,0,0,0.25)';
+            ctx.fillRect(sx - 36, sy - 42, 72, 8);
+            ctx.fillStyle = '#8aff6b';
+            ctx.fillRect(sx - 36, sy - 42, 72 * t, 8);
+            ctx.fillStyle = '#3a2a1a';
+            ctx.font = 'bold 8px "Courier New", monospace';
+            ctx.fillText(Math.round(t * 100) + '%', sx, sy - 35);
+            ctx.textAlign = 'left';
+        }
+
+        drawBuilding() {
+            if (this.key === 'coop') this.drawCoopHouse();
+            else if (this.key === 'barn') this.drawBarn();
+            else if (this.key === 'castle') this.drawCastle();
+            else if (this.key === 'fire') this.drawCampfire();
+            else this.drawHangar();
+        }
+
+        drawLife() {
+            if (this.key === 'barn') this.drawBarnLife();
+            else if (this.key === 'castle') this.drawCastleLife();
+            else if (this.key === 'coop') this.drawCoopLife();
+        }
+
+        // --- a little hen house ---
+        drawCoopHouse() {
+            let x = this.x, y = this.y;
+            drawShadow(x, y, 50, 13);
+            ctx.fillStyle = '#b23c2e'; ctx.fillRect(x - 44, y - 58, 88, 60);
+            ctx.fillStyle = '#7a2820';
+            ctx.beginPath(); ctx.moveTo(x - 52, y - 55); ctx.lineTo(x, y - 86); ctx.lineTo(x + 52, y - 55); ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#5f1f18'; ctx.fillRect(x - 52, y - 58, 104, 5);
+            ctx.fillStyle = '#f4ede0'; ctx.fillRect(x - 44, y - 20, 88, 5);
+            ctx.fillStyle = '#2a1712';
+            ctx.beginPath(); ctx.arc(x, y - 10, 14, Math.PI, 0); ctx.fill();
+            ctx.fillRect(x - 14, y - 10, 28, 10);
+            ctx.fillStyle = '#8a6a3a'; ctx.fillRect(x - 11, y, 22, 5);
+            ctx.fillStyle = '#ffd45e';
+            ctx.beginPath(); ctx.arc(x - 28, y - 38, 7, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(x + 28, y - 38, 7, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#5f1f18'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(x, y - 86); ctx.lineTo(x, y - 98); ctx.stroke();
+            ctx.fillStyle = '#e8a020';
+            ctx.beginPath();
+            ctx.moveTo(x - 6, y - 98); ctx.lineTo(x + 6, y - 102); ctx.lineTo(x + 2, y - 96);
+            ctx.lineTo(x + 8, y - 94); ctx.lineTo(x - 6, y - 92); ctx.closePath(); ctx.fill();
+        }
+        drawCoopLife() {
+            // a hen popping in and out of the doorway, for no reason
+            let ph = (frameCount * 0.008) % 1;
+            if (ph > 0.55) return;
+            let out = Math.sin(ph / 0.55 * Math.PI);
+            ctx.save();
+            ctx.beginPath(); ctx.rect(this.x - 16, this.y - 26, 32, 28); ctx.clip();
+            drawMiniChicken(this.x - 6 + out * 12, this.y - 4, 7, 1, frameCount * 0.2, '#ffffff');
+            ctx.restore();
+        }
+
+        // --- the barn ---
+        drawBarn() {
+            let x = this.x, y = this.y;
+            drawShadow(x, y, 74, 17);
+            // gambrel roof
+            ctx.fillStyle = '#7d2b22';
+            ctx.beginPath();
+            ctx.moveTo(x - 76, y - 62); ctx.lineTo(x - 48, y - 96); ctx.lineTo(x + 48, y - 96);
+            ctx.lineTo(x + 76, y - 62); ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#5f1f18';
+            ctx.beginPath();
+            ctx.moveTo(x - 48, y - 96); ctx.lineTo(x, y - 120); ctx.lineTo(x + 48, y - 96); ctx.closePath(); ctx.fill();
+            // walls
+            ctx.fillStyle = '#c0472f'; ctx.fillRect(x - 68, y - 66, 136, 68);
+            ctx.fillStyle = 'rgba(0,0,0,0.10)'; ctx.fillRect(x + 30, y - 66, 38, 68);
+            // white trim
+            ctx.fillStyle = '#f4ede0';
+            ctx.fillRect(x - 68, y - 68, 136, 5);
+            ctx.fillRect(x - 68, y - 4, 136, 5);
+            // hayloft door + pulley
+            ctx.fillStyle = '#7a3a28'; ctx.fillRect(x - 12, y - 92, 24, 22);
+            ctx.strokeStyle = '#f4ede0'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(x - 12, y - 92); ctx.lineTo(x + 12, y - 70);
+            ctx.moveTo(x + 12, y - 92); ctx.lineTo(x - 12, y - 70); ctx.stroke();
+            ctx.strokeStyle = '#5c4033'; ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(x, y - 120); ctx.lineTo(x, y - 108); ctx.stroke();
+            // big open doorway
+            ctx.fillStyle = '#241209'; ctx.fillRect(x - 30, y - 52, 60, 54);
+            // doors folded back either side
+            ctx.fillStyle = '#a83c26'; ctx.fillRect(x - 46, y - 52, 15, 54);
+            ctx.fillRect(x + 31, y - 52, 15, 54);
+            ctx.strokeStyle = '#f4ede0'; ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x - 46, y - 52); ctx.lineTo(x - 31, y - 2);
+            ctx.moveTo(x - 31, y - 52); ctx.lineTo(x - 46, y - 2);
+            ctx.moveTo(x + 31, y - 52); ctx.lineTo(x + 46, y - 2);
+            ctx.moveTo(x + 46, y - 52); ctx.lineTo(x + 31, y - 2);
+            ctx.stroke();
+            // weathervane
+            ctx.strokeStyle = '#3a2a1a'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(x, y - 120); ctx.lineTo(x, y - 134); ctx.stroke();
+            ctx.fillStyle = '#e8a020';
+            ctx.beginPath();
+            ctx.moveTo(x - 7, y - 134); ctx.lineTo(x + 7, y - 138); ctx.lineTo(x + 2, y - 132);
+            ctx.lineTo(x + 9, y - 130); ctx.lineTo(x - 7, y - 128); ctx.closePath(); ctx.fill();
+        }
+        drawBarnLife() {
+            // residents pacing about inside, seen through the doorway
+            let x = this.x, y = this.y;
+            ctx.save();
+            ctx.beginPath(); ctx.rect(x - 30, y - 52, 60, 52); ctx.clip();
+            // a warm glow from somewhere inside
+            ctx.fillStyle = 'rgba(255,190,90,0.13)'; ctx.fillRect(x - 30, y - 52, 60, 52);
+            for (let i = 0; i < this.residents.length; i++) {
+                let ph = (frameCount * 0.004 + i * 0.31) % 1;
+                let tri = ph < 0.5 ? ph * 2 : 2 - ph * 2;
+                let px = x - 24 + tri * 48;
+                let py = y - 26 + (i % 3) * 11;
+                let c = this.residents[i];
+                drawMiniChicken(px, py, 6.5, ph < 0.5 ? 1 : -1, frameCount * 0.22 + i,
+                                c.crazy ? c.bodyColor : '#e8e8e8');
+            }
+            ctx.restore();
+        }
+
+        // --- the castle ---
+        drawCastle() {
+            let x = this.x, y = this.y;
+            drawShadow(x, y, 106, 22);
+            const WALL = y - 64;
+            // curtain wall
+            ctx.fillStyle = '#9aa0a8'; ctx.fillRect(x - 92, WALL, 184, 66);
+            ctx.fillStyle = '#868d95'; ctx.fillRect(x - 92, WALL, 184, 8);
+            // crenellations
+            ctx.fillStyle = '#9aa0a8';
+            for (let i = 0; i < 9; i++) ctx.fillRect(x - 92 + i * 21, WALL - 11, 13, 11);
+            // stonework
+            ctx.strokeStyle = 'rgba(90,96,104,0.5)'; ctx.lineWidth = 1;
+            for (let r = 0; r < 4; r++) {
+                ctx.beginPath(); ctx.moveTo(x - 92, WALL + 14 + r * 14); ctx.lineTo(x + 92, WALL + 14 + r * 14); ctx.stroke();
+                for (let cbl = 0; cbl < 7; cbl++) {
+                    let bx = x - 92 + cbl * 26 + (r % 2 ? 13 : 0);
+                    ctx.beginPath(); ctx.moveTo(bx, WALL + 14 + r * 14); ctx.lineTo(bx, WALL + 28 + r * 14); ctx.stroke();
+                }
+            }
+            // towers
+            for (let sgn = -1; sgn <= 1; sgn += 2) {
+                let tx = x + sgn * 92;
+                ctx.fillStyle = '#a8aeb6'; ctx.fillRect(tx - 20, y - 98, 40, 100);
+                ctx.fillStyle = '#8f959d';
+                for (let i = 0; i < 3; i++) ctx.fillRect(tx - 20 + i * 15, y - 109, 10, 11);
+                // conical roof
+                ctx.fillStyle = '#3f6fa8';
+                ctx.beginPath();
+                ctx.moveTo(tx - 26, y - 109); ctx.lineTo(tx, y - 146); ctx.lineTo(tx + 26, y - 109);
+                ctx.closePath(); ctx.fill();
+                ctx.fillStyle = '#2f568a';
+                ctx.beginPath();
+                ctx.moveTo(tx - 26, y - 109); ctx.lineTo(tx, y - 128); ctx.lineTo(tx + 26, y - 109);
+                ctx.closePath(); ctx.fill();
+                // arrow slit
+                ctx.fillStyle = '#2a2f36'; ctx.fillRect(tx - 3, y - 88, 6, 16);
+            }
+            // gatehouse arch
+            ctx.fillStyle = '#2a2118';
+            ctx.beginPath(); ctx.arc(x, y - 30, 20, Math.PI, 0); ctx.fill();
+            ctx.fillRect(x - 20, y - 30, 40, 32);
+            // wooden gate with iron bands
+            ctx.fillStyle = '#7a5330';
+            ctx.beginPath(); ctx.arc(x, y - 30, 18, Math.PI, 0); ctx.fill();
+            ctx.fillRect(x - 18, y - 30, 36, 32);
+            ctx.strokeStyle = '#4b4b4b'; ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(x - 18, y - 20); ctx.lineTo(x + 18, y - 20);
+            ctx.moveTo(x - 18, y - 6); ctx.lineTo(x + 18, y - 6);
+            ctx.stroke();
+            // flag, waving
+            let fx = x - 92, ft = frameCount * 0.09;
+            ctx.strokeStyle = '#5c4033'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(fx, y - 146); ctx.lineTo(fx, y - 176); ctx.stroke();
+            ctx.fillStyle = '#e03b5a';
+            ctx.beginPath();
+            ctx.moveTo(fx, y - 176);
+            ctx.quadraticCurveTo(fx + 16, y - 174 + Math.sin(ft) * 4, fx + 32, y - 170 + Math.sin(ft + 1) * 5);
+            ctx.lineTo(fx + 32, y - 156 + Math.sin(ft + 1) * 5);
+            ctx.quadraticCurveTo(fx + 16, y - 160 + Math.sin(ft) * 4, fx, y - 162);
+            ctx.closePath(); ctx.fill();
+            // a tiny chicken on the flag
+            ctx.fillStyle = '#fff2c8';
+            ctx.beginPath();
+            ctx.moveTo(fx + 24, y - 166); ctx.lineTo(fx + 13, y - 171); ctx.lineTo(fx + 14, y - 162);
+            ctx.closePath(); ctx.fill();
+        }
+        drawCastleLife() {
+            let x = this.x, y = this.y;
+            const WALL = y - 64;
+            // the guard on the battlements, marching up and down
+            for (let i = 0; i < this.patrol.length; i++) {
+                let c = this.patrol[i];
+                let ph = (frameCount * 0.0035 + i / Math.max(1, this.patrol.length)) % 1;
+                let tri = ph < 0.5 ? ph * 2 : 2 - ph * 2;
+                let px = x - 78 + tri * 156;
+                drawMiniChicken(px, WALL - 11, 7.5, ph < 0.5 ? 1 : -1, frameCount * 0.24 + i,
+                                c.crazy ? c.bodyColor : '#ffffff');
+                // a pitchfork over the shoulder
+                ctx.save();
+                ctx.translate(px + (ph < 0.5 ? 4 : -4), WALL - 13);
+                ctx.scale(ph < 0.5 ? 1 : -1, 1);
+                ctx.rotate(-0.25);
+                drawPitchfork(8);
+                ctx.restore();
+            }
+            // everyone else peeping over the wall, safe as houses
+            for (let i = 0; i < this.residents.length; i++) {
+                let hx = x - 84 + (i % 9) * 21 + 6;
+                let bob = Math.sin(frameCount * 0.05 + i * 1.3) * 2;
+                let c = this.residents[i];
+                ctx.save();
+                ctx.beginPath(); ctx.rect(hx - 9, WALL - 22, 18, 22); ctx.clip();
+                drawMiniChicken(hx, WALL - 1 + bob, 7, i % 2 ? 1 : -1, 0,
+                                c.crazy ? c.bodyColor : '#ffffff');
+                ctx.restore();
+            }
+        }
+
+        // --- the campfire ---
+        drawCampfire() {
+            let x = this.x, y = this.y;
+            // ring of stones
+            for (let i = 0; i < 9; i++) {
+                let a = (i / 9) * Math.PI * 2;
+                ctx.fillStyle = i % 2 ? '#8f959d' : '#a8aeb6';
+                ctx.beginPath();
+                ctx.ellipse(x + Math.cos(a) * 26, y + Math.sin(a) * 11, 7, 5, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            // logs
+            ctx.strokeStyle = '#7a5330'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(x - 14, y + 3); ctx.lineTo(x + 12, y - 5);
+            ctx.moveTo(x - 12, y - 5); ctx.lineTo(x + 14, y + 3);
+            ctx.stroke(); ctx.lineCap = 'butt';
+            if (this.done) drawFlame(x, y - 3, 1, frameCount);
+        }
+
+        // --- the aeroplane shed ---
+        drawHangar() {
+            let x = this.x, y = this.y;
+            drawShadow(x, y, 60, 14);
+            // trestles and a scattering of parts
+            ctx.strokeStyle = '#a9743d'; ctx.lineWidth = 4;
+            for (let sgn = -1; sgn <= 1; sgn += 2) {
+                ctx.beginPath();
+                ctx.moveTo(x + sgn * 34 - 10, y); ctx.lineTo(x + sgn * 34, y - 22);
+                ctx.lineTo(x + sgn * 34 + 10, y); ctx.stroke();
+            }
+            ctx.fillStyle = '#c69b5f'; ctx.fillRect(x - 46, y - 26, 92, 6);
+            ctx.fillStyle = '#8a94a0';
+            ctx.fillRect(x - 20, y - 6, 14, 6);
+            ctx.beginPath(); ctx.arc(x + 24, y - 3, 5, 0, Math.PI * 2); ctx.fill();
+            // windsock, once the thing is finished and gone
+            if (this.done) {
+                ctx.strokeStyle = '#8a8a8a'; ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.moveTo(x + 52, y); ctx.lineTo(x + 52, y - 46); ctx.stroke();
+                let w = Math.sin(frameCount * 0.05) * 4;
+                ctx.fillStyle = '#ff7b1c';
+                ctx.beginPath();
+                ctx.moveTo(x + 52, y - 46); ctx.lineTo(x + 80, y - 42 + w);
+                ctx.lineTo(x + 80, y - 34 + w); ctx.lineTo(x + 52, y - 34);
+                ctx.closePath(); ctx.fill();
+            }
+        }
+    }
+
+    // --- The aeroplane. There is no reason for it. ---
+    class Plane {
+        constructor(x, y) {
+            this.x = x; this.y = y; this.sx = x; this.sy = y;
+            this.t = 0; this.state = 'takeoff';
+            this.ang = 0; this.prop = 0; this.dir = 1;
+        }
+        update() {
+            this.prop += 1.2;
+            let px = this.x, py = this.y;
+            if (this.state === 'takeoff') {
+                this.t += 1 / 160;
+                let k = Math.min(1, this.t), e = k * k * (3 - 2 * k);
+                this.x = this.sx + (canvas.width * 0.9 - this.sx) * e;
+                this.y = this.sy + (196 - this.sy) * e;
+                if (k >= 1) {
+                    this.state = 'fly'; this.t = 1.55;
+                    showBanner('CHICKEN AIRLINES!', '#9ad8ff');
+                    sndSparkle();
+                }
+            } else {
+                this.t += 0.0055;
+                this.x = canvas.width / 2 + Math.sin(this.t) * canvas.width * 0.44;
+                this.y = 192 + Math.sin(this.t * 2) * 34;
+            }
+            let dx = this.x - px, dy = this.y - py;
+            if (Math.abs(dx) > 0.2) this.dir = dx > 0 ? 1 : -1;
+            this.ang = Math.atan2(dy, Math.abs(dx) < 0.001 ? 0.001 : Math.abs(dx)) * 0.55;
+        }
+        draw() {
+            // banner streaming out behind, always the right way up
+            let bx = this.x - this.dir * 62, by = this.y + 6;
+            ctx.strokeStyle = 'rgba(60,60,60,0.7)'; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(this.x - this.dir * 24, this.y + 2); ctx.lineTo(bx, by); ctx.stroke();
+            ctx.save();
+            ctx.translate(bx - this.dir * 34, by);
+            ctx.rotate(Math.sin(frameCount * 0.08) * 0.06);
+            ctx.fillStyle = '#ffd23b'; ctx.fillRect(0, -9, 68, 18);
+            ctx.strokeStyle = '#c9992a'; ctx.lineWidth = 1; ctx.strokeRect(0, -9, 68, 18);
+            ctx.fillStyle = '#7a4a20';
+            ctx.font = 'bold 11px "Courier New", monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('CLUCK!', 34, 4);
+            ctx.textAlign = 'left';
+            ctx.restore();
+
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            ctx.scale(this.dir, 1);
+            ctx.rotate(this.ang);
+            // lower wing
+            ctx.fillStyle = '#d94f3d'; ctx.fillRect(-20, 6, 46, 4);
+            // fuselage
+            ctx.fillStyle = '#e8603f';
+            ctx.beginPath();
+            ctx.moveTo(-30, 2); ctx.lineTo(-8, -8); ctx.lineTo(26, -6);
+            ctx.lineTo(30, 2); ctx.lineTo(-30, 8); ctx.closePath(); ctx.fill();
+            // tail
+            ctx.fillStyle = '#c33f2f';
+            ctx.beginPath(); ctx.moveTo(-30, 2); ctx.lineTo(-38, -14); ctx.lineTo(-24, -6); ctx.closePath(); ctx.fill();
+            // upper wing on struts
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(-6, -8); ctx.lineTo(-6, -20); ctx.moveTo(16, -7); ctx.lineTo(16, -19);
+            ctx.stroke();
+            ctx.fillStyle = '#f2f2f2'; ctx.fillRect(-24, -24, 52, 5);
+            // pilots
+            drawMiniChicken(2, -10, 6, 1, 0, '#ffffff');
+            drawMiniChicken(-14, -9, 5.5, 1, 0, '#fff0c0');
+            // goggles and a scarf on the front one
+            ctx.fillStyle = '#3a3a3a'; ctx.fillRect(2, -14, 6, 3);
+            ctx.fillStyle = '#e03b5a';
+            ctx.beginPath();
+            ctx.moveTo(0, -10);
+            ctx.quadraticCurveTo(-12, -12 + Math.sin(frameCount * 0.3) * 3, -24, -8 + Math.sin(frameCount * 0.3 + 1) * 4);
+            ctx.lineTo(-24, -4 + Math.sin(frameCount * 0.3 + 1) * 4);
+            ctx.quadraticCurveTo(-12, -7, 0, -6);
+            ctx.closePath(); ctx.fill();
+            // propeller, spinning
+            ctx.strokeStyle = 'rgba(60,60,60,0.75)'; ctx.lineWidth = 2;
+            let pw = Math.abs(Math.cos(this.prop)) * 13 + 2;
+            ctx.beginPath(); ctx.ellipse(31, -1, 2, pw, 0, 0, Math.PI * 2); ctx.stroke();
+            ctx.fillStyle = '#8a94a0';
+            ctx.beginPath(); ctx.arc(30, -1, 3, 0, Math.PI * 2); ctx.fill();
+            ctx.restore();
+        }
+    }
+
+    // --- A football falls out of the sky. Chickens being chickens. ---
+    class Ball {
+        constructor() {
+            this.x = canvas.width / 2 + (Math.random() - 0.5) * 300;
+            this.y = playArea.minY + 120 + Math.random() * 180;
+            this.z = 460; this.vz = 0; this.vx = 0; this.vy = 0;
+            this.rot = 0; this.landed = false; this.kickCd = 0;
+        }
+        update() {
+            if (!this.landed) {
+                this.vz -= 0.55; this.z += this.vz;
+                if (this.z <= 0) {
+                    this.z = 0;
+                    if (Math.abs(this.vz) > 2.5) this.vz *= -0.45;
+                    else {
+                        this.vz = 0; this.landed = true;
+                        puff(this.x, this.y, 12, '#e8e8e8', 2.2);
+                        showBanner('FOOTBALL!', '#ffffff');
+                        sndCornLand();
+                    }
+                }
+                return;
+            }
+            if (this.z > 0 || this.vz > 0) {
+                this.z += this.vz; this.vz -= 0.5;
+                if (this.z <= 0) { this.z = 0; this.vz = 0; }
+            }
+            this.x += this.vx; this.y += this.vy;
+            if (this.x < playArea.minX || this.x > playArea.maxX) { this.vx *= -0.8; this.x = clampX(this.x); }
+            if (this.y < playArea.minY || this.y > playArea.maxY) { this.vy *= -0.8; this.y = clampY(this.y); }
+            this.vx *= 0.975; this.vy *= 0.975;
+            this.rot += (Math.abs(this.vx) + Math.abs(this.vy)) * 0.07 * (this.vx >= 0 ? 1 : -1);
+            if (this.kickCd > 0) { this.kickCd--; return; }
+            let mob = nearHens(this.x, this.y);
+            for (let i = 0; i < mob.length; i++) {
+                let c = mob[i];
+                if (c.dead || c.hidden || c.z > 0) continue;
+                if (dist(this.x, this.y, c.x, c.y) < 22) { this.boot(c); break; }
+            }
+        }
+        boot(c) {
+            let a = Math.atan2(this.y - c.y, this.x - c.x);
+            let p = 4.5 + Math.random() * 4.5;
+            this.vx = Math.cos(a) * p;
+            this.vy = Math.sin(a) * p * 0.55;
+            this.vz = 2.6; this.kickCd = 9;
+            puff(this.x, this.y, 5, '#ffffff', 1.5);
+            c.faceCd = 0; c.face(this.x - c.x);
+            sndPeck();
+        }
+        draw() {
+            let sc = 1 / (1 + this.z * 0.004);
+            drawShadow(this.x, this.y, 11 * sc, 4.5 * sc);
+            ctx.save();
+            ctx.translate(this.x, this.y - this.z - 9);
+            ctx.rotate(this.rot);
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath(); ctx.arc(0, 0, 10, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#cfcfcf'; ctx.lineWidth = 1; ctx.stroke();
+            ctx.fillStyle = '#1e1e1e';
+            ctx.beginPath();
+            for (let i = 0; i < 5; i++) {
+                let a = (i / 5) * Math.PI * 2;
+                ctx.moveTo(Math.cos(a) * 3, Math.sin(a) * 3);
+                ctx.arc(Math.cos(a) * 6.2, Math.sin(a) * 6.2, 2.4, 0, Math.PI * 2);
+            }
+            ctx.fill();
+            ctx.beginPath(); ctx.arc(0, 0, 3.2, 0, Math.PI * 2); ctx.fill();
+            ctx.restore();
+        }
+    }
+
+    // --- Keeping all the hobbies staffed ---
+    function updateProjects() {
+        // one build at a time, in order, so the crew is never split
+        if (!projects.some(pr => !pr.done)) {
+            for (let spec of PROJECT_SPECS) {
+                if (projects.some(pr => pr.key === spec.key)) continue;
+                if (chickens.length >= spec.need) {
+                    projects.push(new Project(spec));
+                    showBanner('BUILDING ' + article(spec.name) + spec.name + '!', '#ffd23b');
+                    sndSparkle();
+                    break;
+                }
+            }
+        }
+        for (let pr of projects) pr.update();
+
+        // pitchfork brigade
+        if (chickens.length >= GUARD_AT) {
+            for (let i = guards.length - 1; i >= 0; i--) {
+                if (guards[i].dead || guards[i].job !== 'guard') guards.splice(i, 1);
+            }
+            if (guards.length < GUARD_COUNT && frameCount % 24 === 0) {
+                let n = chickens.length;
+                for (let i = 0; i < 40 && guards.length < GUARD_COUNT; i++) {
+                    let c = chickens[(Math.random() * n) | 0];
+                    if (!idleHen(c)) continue;
+                    c.job = 'guard'; c.guardCd = 0; c.jab = 0;
+                    c.patrolT = Math.random() * 6.283;
+                    c.releaseFood();
+                    guards.push(c);
+                    puff(c.x, c.y - 14, 3, '#c8d0d8', 1.2);
+                }
+                if (guards.length > 0 && !guardsAnnounced) {
+                    guardsAnnounced = true;
+                    showBanner('PITCHFORK PATROL!', '#8aff6b');
+                }
+            }
+        }
+
+        // football
+        if (!ball && chickens.length >= BALL_AT) ball = new Ball();
+        if (ball) {
+            ball.update();
+            if (ball.landed && frameCount % 30 === 0) {
+                let squad = 0;
+                for (let c of chickens) if (c.job === 'soccer') squad++;
+                if (squad < BALL_SQUAD) {
+                    let n = chickens.length;
+                    for (let i = 0; i < 30 && squad < BALL_SQUAD; i++) {
+                        let c = chickens[(Math.random() * n) | 0];
+                        if (!idleHen(c)) continue;
+                        if (dist(c.x, c.y, ball.x, ball.y) > 320) continue;
+                        c.job = 'soccer'; c.releaseFood(); squad++;
+                    }
+                }
+            }
+        }
     }
 
     // ============================================================
@@ -3111,7 +4077,10 @@
         }
     }
 
+    const CONFETTI_MAX = 380;
     function spawnConfetti(n) {
+        if (confetti.length >= CONFETTI_MAX) return;
+        n = Math.min(n, CONFETTI_MAX - confetti.length);
         const cols = ['#ff5a7a', '#ffd23b', '#4dd2ff', '#8aff6b', '#c58bff', '#ff9b54', '#ffffff'];
         for (let i = 0; i < n; i++) {
             confetti.push({
@@ -3156,10 +4125,14 @@
         winHoldTimer = 0;
         coop = new Coop(canvas.width / 2, horizonY + 78);
         // clear the hazards so nothing eats a chicken during the parade
-        foxes.length = 0;
-        bears.length = 0;
+        predators.length = 0;
+        farmers.length = 0;
         rabbits.length = 0;
-        for (let c of chickens) { c.state = 'toCoop'; c.releaseFood(); }
+        ball = null;
+        for (let c of chickens.slice()) {
+            releaseJob(c);
+            c.state = 'toCoop'; c.releaseFood();
+        }
         showBanner('YOU DID IT!', '#ffd23b');
         playVictory();          // the win track takes over from here
         spawnConfetti(120);
@@ -3174,15 +4147,18 @@
 
     // Wipe the board and start a brand new game.
     function restartGame() {
-        chickens = []; horses = []; cows = []; foxes = []; eggs = [];
-        foods = []; bags = []; particles = []; bears = []; skyBirds = [];
+        chickens = []; horses = []; cows = []; predators = []; eggs = [];
+        foods = []; bags = []; particles = []; skyBirds = [];
         bolts = []; grasses = []; rabbits = []; poops = []; flies = [];
         confetti = []; coop = null; chickensHoused = 0;
-        wolves = []; gators = []; farmers = []; rainClouds = [];
-        nextHazardAt = frameCount + 60 * 25;
-        nextRainAt = frameCount + 60 * 34;
+        farmers = []; angels = []; scorches = [];
+        projects = []; guards = []; guardsAnnounced = false;
+        ball = null; plane = null;
+        nextPredAt = frameCount + 60 * 26;
+        nextFarmerAt = frameCount + 60 * 44;
+        nextStampedeAt = frameCount + 60 * 50;
         score = 0; scorePop = 0;
-        chickensLost = 0; foxesZapped = 0; chickensStarved = 0;
+        chickensLost = 0; foxesZapped = 0; chickensStarved = 0; chickensVaporised = 0;
         grassStolen = 0; cowMeals = 0; crazyDeparted = 0;
         boltCd = 0; boltDeny = 0; flash = 0; denyFlash = 0;
         banner = null;
@@ -3308,7 +4284,8 @@
 
         ctx.font = 'bold 12px "Courier New", monospace';
         ctx.fillStyle = 'rgba(255,255,255,0.75)';
-        ctx.fillText('Feed the flock. Zap the animals to scare them off!', 20, 104);
+        ctx.fillText('Feed the flock! Zap scares EVERY predator -- but the bolt lands', 20, 84);
+        ctx.fillText('wherever it likes, so mind you do not zap your own chickens.', 20, 98);
     }
 
     // Big tappable LIGHTNING button -- the whole reason mobile needs buttons,
@@ -3441,8 +4418,14 @@
         ctx.fillText('CLICK TO START', 0, 0);
         ctx.font = 'bold 21px "Courier New", monospace';
         ctx.fillStyle = '#ffffff';
-        ctx.fillText('SPACEBAR or CLICK to throw corn', 0, 44);
-        ctx.fillText('P or the bolt button to scare animals away', 0, 72);
+        ctx.fillText('SPACEBAR or CLICK to throw corn', 0, 40);
+        ctx.fillText('P or the bolt button scares EVERY predator', 0, 66);
+        ctx.font = 'bold 16px "Courier New", monospace';
+        ctx.fillStyle = '#ffd0a0';
+        ctx.fillText('...but the bolt lands wherever it likes -- do not zap your own chickens!', 0, 94);
+        ctx.font = 'bold 20px "Courier New", monospace';
+        ctx.fillStyle = '#8aff6b';
+        ctx.fillText('Raise 300 plump chickens and see what they get up to', 0, 128);
         ctx.restore();
         ctx.textAlign = 'left';
     }
@@ -3470,7 +4453,7 @@
         let bw = 300, bh = 22, bx = cx - bw / 2, by = 92;
         ctx.font = 'bold 13px "Courier New", monospace';
         ctx.fillStyle = '#ffffff';
-        ctx.fillText('GOAL: raise ' + WIN_PLUMP + ' plump chickens', cx, by - 6);
+        ctx.fillText('GOAL: ' + WIN_PLUMP + ' PLUMP CHICKENS', cx, by - 6);
         // track
         ctx.fillStyle = 'rgba(0,0,0,0.45)';
         ctx.fillRect(bx - 2, by - 2, bw + 4, bh + 4);
@@ -3482,7 +4465,8 @@
         ctx.fillRect(bx, by, fillW, bh);
         // segment ticks
         ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 1;
-        for (let i = 1; i < WIN_PLUMP; i++) {
+        let tick = WIN_PLUMP > 30 ? 50 : 1;
+        for (let i = tick; i < WIN_PLUMP; i += tick) {
             let x = bx + (bw / WIN_PLUMP) * i;
             ctx.beginPath(); ctx.moveTo(x, by); ctx.lineTo(x, by + bh); ctx.stroke();
         }
@@ -3520,7 +4504,7 @@
         for (let i = 0; i < kn; i++) {
             let hx = kx + i * kgap, full = i < cornReady;
             // refilling kernel grows in
-            let grow = (i === cornReady && cornReady < CORN_MAG) ? (1 - cornRefillCd / CORN_REFILL_FRAMES) : (full ? 1 : 0);
+            let grow = (i === cornReady && cornReady < CORN_MAG) ? (1 - cornRefillCd / refillFrames()) : (full ? 1 : 0);
             ctx.globalAlpha = full ? 1 : (i === cornReady ? 0.35 + grow * 0.5 : 0.18);
             let r = 5 * (full ? 1 : Math.max(0.5, grow));
             ctx.fillStyle = full ? '#ffcc00' : '#b8a24a';
@@ -3534,27 +4518,37 @@
     function drawHUD() {
         if (gameState === 'playing') drawGoalBar();
 
-        let fattest = 0;
-        for (let c of chickens) if (c.fatness > fattest) fattest = c.fatness;
-
         ctx.font = 'bold 16px "Courier New", monospace';
         ctx.textAlign = 'right';
         let left = bagsLeft();
-        let crazyN = chickens.filter(c => c.crazy).length;
-        let hungryN = chickens.filter(c => c.hunger > HUNGER_WARN).length;
+        let crazyN = 0;
+        for (let c of chickens) if (c.crazy) crazyN++;
         let horsePlump = horses.length ? horses[0].plump : 0;
+        // What the flock is up to right now
+        let building = null, safeN = 0, jobN = 0;
+        for (let pr of projects) {
+            if (!pr.done && !building) building = pr;
+            safeN += pr.residents.length + pr.patrol.length;
+        }
+        for (let c of chickens) if (c.job) jobN++;
+        let nextUp = null;
+        for (let spec of PROJECT_SPECS) {
+            if (!projects.some(pr => pr.key === spec.key)) { nextUp = spec; break; }
+        }
         let lines = [
             ['CHICKENS ' + chickens.length + (crazyN ? '  (' + crazyN + ' CRAZY)' : ''),
                 crazyN ? '#ff6bcb' : '#FFD700'],
-            ['CORN ' + left + '/' + CORN_MAG, left > 0 ? '#FFD700' : '#ff8080'],
-            ['HUNGRY ' + hungryN, hungryN > 0 ? '#ffa53b' : '#FFD700'],
-            ['FATTEST ' + fattest.toFixed(2) + 'x', '#FFD700'],
-            ['HORSE: ' + horseSizeLabel(horsePlump), horsePlump > 0.75 ? '#ffb060' : '#e0b080'],
-            ['FOX ' + chickensLost + '  STARVED ' + chickensStarved,
-                (chickensLost || chickensStarved) ? '#ff8080' : '#FFD700'],
-            ['ZAPPED ' + foxesZapped + '  FLEW OFF ' + crazyDeparted, '#9ad8ff'],
-            ['GRASS ' + grasses.filter(g => g.ripe).length + '/' + grasses.length +
-                '  COW ' + cowMeals + '  RAB ' + grassStolen, '#b6ee6a']
+            ['PLUMP ' + plumpCount() + ' / ' + WIN_PLUMP, '#8aff6b'],
+            ['CORN ' + left + '/' + CORN_MAG + '  (bags of ' + bagKernels() + ')',
+                left > 0 ? '#FFD700' : '#ff8080'],
+            ['EATEN ' + chickensLost + '   ZAPPED BY YOU ' + chickensVaporised,
+                (chickensLost || chickensVaporised) ? '#ff8080' : '#FFD700'],
+            ['SCARED OFF ' + foxesZapped + '   FLEW AWAY ' + crazyDeparted, '#9ad8ff'],
+            ['AT WORK ' + jobN + '   SAFE INDOORS ' + safeN, '#ffd8a0'],
+            [building ? 'BUILDING ' + building.spec.name + ' ' + Math.round(building.t * 100) + '%'
+                      : (nextUp ? 'NEXT BUILD AT ' + nextUp.need + ' CHICKENS' : 'ALL BUILT!'),
+                building ? '#ffd23b' : '#c8d0d8'],
+            ['HORSE: ' + horseSizeLabel(horsePlump), horsePlump > 0.75 ? '#ffb060' : '#e0b080']
         ];
         for (let i = 0; i < lines.length; i++) {
             let y = 26 + i * 18;
@@ -3567,9 +4561,9 @@
         // Countdown hints
         ctx.font = 'bold 12px "Courier New", monospace';
         let toEgg = Math.ceil((EGG_SPAWN_FRAMES - (frameCount % EGG_SPAWN_FRAMES)) / 60);
-        let toFox = Math.ceil((FOX_SPAWN_FRAMES - (frameCount % FOX_SPAWN_FRAMES)) / 60);
+        let toPred = Math.max(0, Math.ceil((nextPredAt - frameCount) / 60));
         ctx.fillStyle = 'rgba(255,255,255,0.9)';
-        ctx.fillText('egg in ' + toEgg + 's   fox in ' + toFox + 's', canvas.width - 20, 190);
+        ctx.fillText('egg in ' + toEgg + 's   trouble in ' + toPred + 's', canvas.width - 20, 190);
         if (left < CORN_MAG) {
             ctx.fillStyle = '#ffb0b0';
             ctx.fillText('more corn in ' + Math.ceil(cornRefillCd / 60) + 's', canvas.width - 20, 206);
@@ -3626,7 +4620,7 @@
             ctx.fillText('THE FLOCK IS GONE', cx, cy - 50);
             ctx.font = 'bold 24px "Courier New", monospace';
             ctx.fillStyle = '#ffffff';
-            ctx.fillText('Zap the animals with lightning to scare them off!', cx, cy + 4);
+            ctx.fillText('Zap the predators with lightning to scare them off!', cx, cy + 4);
             ctx.font = 'bold 30px "Courier New", monospace';
             ctx.fillStyle = '#FFD700';
             ctx.fillText('SCORE: ' + score, cx, cy + 48);
@@ -3815,23 +4809,20 @@
                     layer ? layer.x : playArea.minX + Math.random() * (playArea.maxX - playArea.minX),
                     layer ? layer.y : playArea.minY + Math.random() * (playArea.maxY - playArea.minY)
                 );
-                e.crazy = crazyEra();
+                e.crazy = crazyEra() && Math.random() < CRAZY_HATCH;
                 eggs.push(e);
             }
         }
-        if (frameCount % FOX_SPAWN_FRAMES === 0) {
-            // Foxes attack in packs, and from both sides at once
-            let prog = plumpCount() / WIN_PLUMP;
-            let n = prog >= 0.7 ? FOX_WAVE[2] : (prog >= 0.4 ? FOX_WAVE[1] : FOX_WAVE[0]);
-            for (let i = 0; i < n; i++) foxes.push(new Fox(i % 2 === 0 ? -1 : 1));
-            sndYip();
-            if (n > 1) showBanner(n + ' FOXES!', '#ff8080');
+        // Something hungry turns up on a timer -- more of them, more often,
+        // the bigger the flock gets.
+        if (frameCount >= nextPredAt) {
+            spawnPredatorWave();
+            nextPredAt = frameCount + 60 * (19 + Math.random() * 13);
         }
-        // A bear. No reason. It just runs through sometimes.
+        // A bear specifically, so the crazy ones always have someone to leave with
         if (frameCount >= nextBearAt) {
-            bears.push(new Bear());
-            sndGrowl();
-            nextBearAt = frameCount + 60 * (35 + Math.random() * 55);
+            if (predators.length < PRED_MAX) { predators.push(new Bear()); sndGrowl(); }
+            nextBearAt = frameCount + 60 * (45 + Math.random() * 50);
         }
         // A new clump of grass sprouts somewhere with elbow room
         if (frameCount >= nextGrassAt) {
@@ -3839,20 +4830,19 @@
             nextGrassAt = frameCount + 60 * (3 + Math.random() * 4);
         }
 
-        // --- Hazards ---
-        // One roaming hazard (wolf / gator / farmer) at a time.
-        if (frameCount >= nextHazardAt) {
-            if (wolves.length + gators.length + farmers.length === 0) {
-                spawnRoamingHazard();
-                nextHazardAt = frameCount + 60 * (HAZARD_GAP_MIN + Math.random() * HAZARD_GAP_RAND);
-            } else {
-                nextHazardAt = frameCount + 60 * 5; // busy -- check back shortly
-            }
+        // The farmer stomps in to shout about something. He is harmless.
+        if (frameCount >= nextFarmerAt) {
+            if (farmers.length === 0) farmers.push(new Farmer());
+            nextFarmerAt = frameCount + 60 * (48 + Math.random() * 40);
         }
-        // A little rain cloud drifts in and leaves a puddle behind
-        if (frameCount >= nextRainAt) {
-            if (rainClouds.length === 0) rainClouds.push(new RainCloud());
-            nextRainAt = frameCount + 60 * (36 + Math.random() * 26);
+
+        // Everything the flock has decided to do with its spare time
+        updateProjects();
+
+        // And every so often, rabbits. Simply hundreds of rabbits.
+        if (frameCount >= nextStampedeAt) {
+            triggerRabbitStampede();
+            nextStampedeAt = frameCount + 60 * (48 + Math.random() * 42);
         }
         // Lose: the whole flock is gone and nothing left to hatch
         if (chickens.length === 0 && eggs.length === 0) {
@@ -3865,7 +4855,7 @@
             eggBoomDone = true;
             for (let c of chickens) {
                 let e = new Egg(c.x, c.y);
-                e.crazy = true;
+                e.crazy = Math.random() < 0.5;
                 eggs.push(e);
                 puff(c.x, c.y, 9, '#ffd6f5', 1.8);
             }
@@ -3922,19 +4912,20 @@
         // safely in the coop, declare the win.
         if (gameState === 'winning') {
             if (frameCount % 4 === 0) spawnConfetti(3);
-            if (chickens.length === 0 || ++winHoldTimer > 60 * 8) finishWin();
+            if (chickens.length === 0 || ++winHoldTimer > 60 * 11) finishWin();
         } else if (gameState === 'won') {
             if (frameCount % 10 === 0) spawnConfetti(4);
         }
         if (gameState !== 'playing') updateConfetti();
+        if (plane) plane.update();   // it just keeps going, win or lose
 
         // Corn: refill the magazine on a timer, and if space is held keep
         // throwing at the capped rate (a steady feed, never a flood).
         if (cornThrowCd > 0) cornThrowCd--;
         if (cornReady < CORN_MAG) {
-            if (--cornRefillCd <= 0) { cornReady++; cornRefillCd = CORN_REFILL_FRAMES; }
+            if (--cornRefillCd <= 0) { cornReady++; cornRefillCd = refillFrames(); }
         } else {
-            cornRefillCd = CORN_REFILL_FRAMES;
+            cornRefillCd = refillFrames();
         }
         if (spaceHeld && gameState === 'playing') throwCorn();
 
@@ -3957,19 +4948,23 @@
         bags = bags.filter(b => b.active);
         eggs = eggs.filter(e => e.active);
         chickens = chickens.filter(c => !c.dead);
-        foxes = foxes.filter(f => f.active);
+        predators = predators.filter(p => p.active);
         particles = particles.filter(p => p.active);
-        bears = bears.filter(b => b.active);
         skyBirds = skyBirds.filter(b => b.active);
         bolts = bolts.filter(b => b.active);
         grasses = grasses.filter(g => !g.eaten);
         rabbits = rabbits.filter(r => r.active);
         poops = poops.filter(p => p.active);
         flies = flies.filter(f => f.active);
-        wolves = wolves.filter(w => w.active);
-        gators = gators.filter(g => g.active);
         farmers = farmers.filter(f => f.active);
-        rainClouds = rainClouds.filter(r => r.active);
+        for (let a of angels) { a.life--; a.z += 0.55; a.wob += 0.07; }
+        angels = angels.filter(a => a.life > 0);
+        for (let sc of scorches) sc.life--;
+        scorches = scorches.filter(sc => sc.life > 0);
+
+        // Rebuild the lookup grids before anybody consults them
+        gridBuild(henGrid, chickens, HEN_CELL);
+        gridBuild(cornGrid, foods, CORN_CELL);
 
         // Update
         foods.forEach(f => f.update());
@@ -3978,32 +4973,34 @@
         chickens.forEach(c => c.update());
         horses.forEach(h => h.update());
         cows.forEach(c => c.update());
-        foxes.forEach(f => f.update());
-        bears.forEach(b => b.update());
+        predators.forEach(p => p.update());
         skyBirds.forEach(b => b.update());
         bolts.forEach(b => b.update());
         grasses.forEach(g => g.update());
         rabbits.forEach(r => r.update());
         poops.forEach(p => p.update());
         flies.forEach(f => f.update());
-        wolves.forEach(w => w.update());
-        gators.forEach(g => g.update());
         farmers.forEach(f => f.update());
-        rainClouds.forEach(r => r.update());
         particles.forEach(p => p.update());
 
-        // Y-Sort rendering
-        let renderables = [...poops, ...grasses, ...foods, ...bags, ...eggs, ...flies, ...chickens, ...rabbits, ...horses, ...cows, ...foxes, ...bears,
-                           ...wolves, ...gators, ...farmers];
+        // Scorch marks from the lightning, painted onto the grass
+        drawScorches();
+
+        // Y-Sort rendering. Chickens tucked up inside a building are drawn by
+        // that building, so they are left out of the sort.
+        let onField = [];
+        for (let i = 0; i < chickens.length; i++) if (!chickens[i].hidden) onField.push(chickens[i]);
+        let renderables = [...poops, ...grasses, ...foods, ...bags, ...eggs, ...flies, ...onField,
+                           ...rabbits, ...horses, ...cows, ...predators, ...farmers, ...projects];
         if (coop) renderables.push(coop);
+        if (ball) renderables.push(ball);
         renderables.sort((a, b) => a.y - b.y);
         renderables.forEach(entity => entity.draw());
 
         // Particles ride on top
         particles.forEach(p => p.draw());
-
-        // Rain clouds float above the field
-        rainClouds.forEach(r => r.draw());
+        drawAngels();
+        if (plane) plane.draw();
 
         // Confetti falls in front of everything
         if (confetti.length) drawConfetti();
