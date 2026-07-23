@@ -104,7 +104,6 @@
     let nextRainAt = 60 * 34;
 
     // Mouse aiming -- corn is placed where you click
-    let mouseX = -999, mouseY = -999, mouseIn = false;
     // Raw (unclamped) pointer, for on-screen buttons up in the sky area
     let rawMouseX = -999, rawMouseY = -999;
 
@@ -540,17 +539,13 @@
     // Throw one handful of corn -- at (tx,ty) if given, otherwise wherever the
     // mouse is, otherwise somewhere random. Rate-limited, so holding or mashing
     // can never flood the field.
-    function throwCorn(tx, ty) {
+    function throwCorn() {
         if (gameState !== 'playing') return false;
         if (cornThrowCd > 0) return false;
         if (cornReady <= 0) { denyFlash = 30; return false; }
-        let x, y;
-        if (tx !== undefined) { x = tx; y = ty; }
-        else if (mouseIn) { x = mouseX; y = mouseY; }
-        else {
-            x = playArea.minX + Math.random() * (playArea.maxX - playArea.minX);
-            y = playArea.minY + Math.random() * (playArea.maxY - playArea.minY);
-        }
+        // No aiming -- it lands wherever it lands, like chucking a handful
+        let x = playArea.minX + Math.random() * (playArea.maxX - playArea.minX);
+        let y = playArea.minY + Math.random() * (playArea.maxY - playArea.minY);
         cornReady--;
         cornThrowCd = CORN_THROW_GAP;
         bags.push(new CornBag(clampX(x), clampY(y)));
@@ -785,14 +780,14 @@
             sndCluck();
             puff(this.x, this.y, 18, '#c9b184', 3.2);
             // Fling the kernels outwards -- they arc, bounce and roll to a stop
-            // Tighter scatter than before, so where you aim is where it lands
-            for (let i = 0; i < 26; i++) {
+            // A big messy splatter of corn flung everywhere
+            for (let i = 0; i < 32; i++) {
                 let angle = Math.random() * Math.PI * 2;
-                let power = 0.7 + Math.random() * 1.7;
+                let power = 1.6 + Math.random() * 5.0;
                 foods.push(new Food(this.x, this.y, {
                     vx: Math.cos(angle) * power,
-                    vy: Math.sin(angle) * power * 0.5,
-                    vz: 0.8 + Math.random() * 1.1
+                    vy: Math.sin(angle) * power * 0.45,
+                    vz: 1.6 + Math.random() * 3.2
                 }));
             }
         }
@@ -3536,28 +3531,6 @@
     }
 
     // Paint the unsafe patches onto the grass so it's obvious where NOT to feed.
-    // Simple crosshair showing where the corn will land.
-    function drawReticle() {
-        if (gameState !== 'playing' || !mouseIn) return;
-        let col = '#8aff6b';
-        let scatter = 46;
-        ctx.save();
-        ctx.globalAlpha = cornReady > 0 ? 1 : 0.35;
-        ctx.strokeStyle = col; ctx.lineWidth = 2;
-        ctx.setLineDash([5, 5]);
-        ctx.beginPath(); ctx.ellipse(mouseX, mouseY, scatter, scatter * 0.45, 0, 0, Math.PI * 2); ctx.stroke();
-        ctx.setLineDash([]);
-        ctx.beginPath();
-        ctx.moveTo(mouseX - 13, mouseY); ctx.lineTo(mouseX - 4, mouseY);
-        ctx.moveTo(mouseX + 4, mouseY); ctx.lineTo(mouseX + 13, mouseY);
-        ctx.moveTo(mouseX, mouseY - 9); ctx.lineTo(mouseX, mouseY - 3);
-        ctx.moveTo(mouseX, mouseY + 3); ctx.lineTo(mouseX, mouseY + 9);
-        ctx.stroke();
-        ctx.fillStyle = col;
-        ctx.beginPath(); ctx.arc(mouseX, mouseY, 2, 0, Math.PI * 2); ctx.fill();
-        ctx.restore();
-    }
-
     function drawHUD() {
         if (gameState === 'playing') drawGoalBar();
 
@@ -3776,11 +3749,8 @@
     canvas.addEventListener('mousemove', (e) => {
         let p = canvasPos(e);
         rawMouseX = p.x; rawMouseY = p.y;
-        mouseX = clampX(p.x); mouseY = clampY(p.y);
-        // don't aim corn while hovering the music button
-        mouseIn = gameStarted && p.y > horizonY - 10 && !inAnyBtn(p.x, p.y);
     });
-    canvas.addEventListener('mouseleave', () => { mouseIn = false; });
+    canvas.addEventListener('mouseleave', () => { rawMouseX = -999; rawMouseY = -999; });
     canvas.addEventListener('mousedown', (e) => {
         initAudio();
         if (e.button !== 0) return;
@@ -3791,9 +3761,7 @@
         if (inBoltBtn(p.x, p.y)) { pressBolt(); return; }
         if (inMusicBtn(p.x, p.y)) { toggleMusic(); return; }
         if (gameState === 'won' || gameState === 'lost') { if (endScreenReady()) restartGame(); return; }
-        rawMouseX = p.x; rawMouseY = p.y;
-        mouseX = clampX(p.x); mouseY = clampY(p.y); mouseIn = true;
-        throwCorn(mouseX, mouseY);
+        throwCorn();
     });
     // Touch: same thing, so it works on a tablet
     canvas.addEventListener('touchstart', (e) => {
@@ -3807,13 +3775,8 @@
         if (!gameStarted) { beginGame(); return; }
         if (inBoltBtn(rx, ry)) { pressBolt(); return; }
         if (inMusicBtn(rx, ry)) { toggleMusic(); return; }
-        let x = clampX(rx), y = clampY(ry);
         if (gameState === 'won' || gameState === 'lost') { if (endScreenReady()) restartGame(); return; }
-        // show the aiming reticle where they tapped, so the danger warning
-        // is visible on touch devices too (no hover to rely on)
-        rawMouseX = rx; rawMouseY = ry;
-        mouseX = x; mouseY = y; mouseIn = true;
-        throwCorn(x, y);
+        throwCorn();
     }, { passive: false });
 
     window.addEventListener('keyup', (e) => {
@@ -4041,8 +4004,6 @@
 
         // Rain clouds float above the field
         rainClouds.forEach(r => r.draw());
-        // Aiming crosshair for the corn
-        drawReticle();
 
         // Confetti falls in front of everything
         if (confetti.length) drawConfetti();

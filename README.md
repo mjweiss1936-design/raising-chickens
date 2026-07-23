@@ -8,7 +8,7 @@ the visiting animals with lightning to shoo them away.
 ## How to play
 
 - **SPACEBAR or click** to throw a handful of corn. Hold space to keep feeding.
-- Click a spot to aim the corn there, if you like.
+  It lands wherever it lands and scatters everywhere -- no aiming.
 - **P** (or the bolt button) calls down lightning and scares off **every** animal
   on the farm -- foxes, the wolf, the alligator, the angry farmer, even the bear.
 - **F** fullscreen, **M** mute, **N** music on/off (starts off).
