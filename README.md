@@ -41,6 +41,16 @@ needs more chickens than the last one:
 | 244 | an aeroplane, which they fly around the sky trailing a banner, for no reason |
 | 268+ | **another house**, and then another, and another, for as long as there is room in the yard |
 
+## Babies
+
+Every minute or so a baby horse or a baby cow simply turns up standing next
+to its mother, with no explanation offered and none required. They start at
+40% size and grow to full size over about three minutes, and while they are
+little they stay at their mother's side and trot to catch up when they fall
+behind. Nothing is frightened of a calf, and the little ones don't poop.
+
+Three horses and three cows is the lot.
+
 There is no limit on how many houses go up -- only on how much space is left.
 More houses means more beds, and a hen in a bed is a hen nothing can eat.
 
