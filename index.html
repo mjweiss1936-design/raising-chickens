@@ -629,12 +629,13 @@
             HAZARD_GAP_MIN = 38; HAZARD_GAP_RAND = 24;
         }
     }
+    // Switching mid-game applies the new rules straight away and does NOT
+    // restart -- losing your flock and your score to a stray tap is horrible.
     function toggleDifficulty() {
         easyMode = !easyMode;
         applyDifficulty();
-        restartGame();      // fresh start under the new rules...
         showBanner(easyMode ? 'EASY MODE' : 'HARD MODE', easyMode ? '#8aff6b' : '#ff8080');
-    }                       // ...banner after, since restart clears it
+    }
     applyDifficulty();
     let coop = null;                  // the henhouse, built when you win
     let confetti = [];
