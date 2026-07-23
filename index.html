@@ -569,7 +569,12 @@
 
     // A big flock eats a LOT. Past a hundred birds the sacks get fatter and
     // the supply comes back quicker, so you can actually keep up with them.
-    function bagKernels() { return Math.min(80, 26 + ((chickens.length / 6) | 0)); }
+    const BIG_SACK_AT = 50;           // past this many mouths, out come the big sacks
+    let bigSackAnnounced = false;
+    function bagKernels() {
+        let base = chickens.length >= BIG_SACK_AT ? 46 : 26;
+        return Math.min(96, base + ((chickens.length / 6) | 0));
+    }
     function refillFrames() { return Math.max(48, CORN_REFILL_FRAMES - chickens.length * 0.26); }
     let cornReady = CORN_MAG;
     let cornRefillCd = CORN_REFILL_FRAMES;
@@ -710,7 +715,7 @@
     }
     // Is this bird free to be handed a job?
     function idleHen(c) {
-        return c && !c.dead && !c.job && !c.crazy &&
+        return c && !c.dead && !c.job && !c.crazy && c.jobCd <= 0 &&
                c.state !== 'exodus' && c.state !== 'toCoop' && c.fatness > 0.75;
     }
 
@@ -989,6 +994,8 @@
             this.sitting = false;
             this.guardCd = 0;
             this.jab = 0;
+            this.stayCd = 0;      // frames left on this shift
+            this.jobCd = 0;       // must go and eat before taking another one
 
             // Each bird keeps its own patch of yard and mooches around it, so
             // the flock spreads out instead of orbiting one spot.
@@ -1031,7 +1038,7 @@
                 eggs.push(e);
             }
             // She stays (just) plump through a clutch, so the flock still grows
-            this.fatness = Math.max(1.0, this.fatness - 0.20);
+            this.fatness = Math.max(1.0, this.fatness - 0.25);
             this.countedPlump = this.fatness >= PLUMP_THRESHOLD; // can earn it again
             this.layCd = 60 * 10;
             addScore(30); // laying a nest is good farming
@@ -1132,14 +1139,20 @@
             }
 
             // --- Has this one got a job on? ---
-            // Nobody on a job can go and peck for themselves, so the rest of
-            // the flock brings them their lunch. They keep their condition.
+            // A hen tucked up in a house is safe, but there is nothing to eat
+            // in there -- she doesn't grow an ounce. Sooner or later she has to
+            // come back out, find some corn, and let somebody else have her bed.
             if (this.job) {
-                if (this.fatness < 1) this.fatness = Math.min(1, this.fatness + 0.0012);
-                else if (this.fatness < PLUMP_THRESHOLD + 0.04) this.fatness += 0.0007;
-                if (this.job === 'inside' || this.job === 'patrol') return;  // the building runs them
-                if (this.updateJob()) return;
+                if (this.stayCd > 0 && --this.stayCd <= 0) {
+                    puff(this.x, this.y - 12, 4, '#fff2c8', 1.3);
+                    this.jobCd = 60 * (9 + Math.random() * 9);   // off to find her supper
+                    releaseJob(this);
+                } else {
+                    if (this.job === 'inside' || this.job === 'patrol') return;  // the building runs them
+                    if (this.updateJob()) return;
+                }
             }
+            if (this.jobCd > 0) this.jobCd--;
 
             // Chicks grow to full size on their own. Past 1.0 you only get
             // fatter by eating, and it is deliberately glacial.
@@ -2275,7 +2288,7 @@
 
     class Gator extends Hunter {
         constructor(side) {
-            super('gator', { speed: 3.0, grabR: 30, scareR: 175, patience: 24, label: 'ALLIGATOR!' }, side);
+            super('gator', { speed: 4.4, grabR: 32, scareR: 175, patience: 24, label: 'ALLIGATOR!' }, side);
         }
         draw() {
             drawShadow(this.x, this.y, 42, 10);
@@ -3210,16 +3223,72 @@
     const GUARD_AT = 110, GUARD_COUNT = 5;
     const BALL_AT = 100, BALL_SQUAD = 8;
 
+    // How long a shift lasts, in seconds: [minimum, extra at random].
+    // Nobody eats while they're working, so everybody clocks off eventually.
+    const SHIFT = {
+        build:  [40, 25],
+        inside: [22, 16],   // a spell indoors where nothing can eat you
+        patrol: [26, 16],
+        sit:    [24, 18],
+        guard:  [34, 22],
+        soccer: [26, 20]
+    };
+
     const PROJECT_SPECS = [
-        { key: 'coop',   need: 20,  x: 148,  y: 336, w: 78,  h: 108, crew: 4, work: 60 * 78,  name: 'HEN HOUSE' },
-        { key: 'fire',   need: 40,  x: 1122, y: 470, w: 34,  h: 34,  crew: 3, work: 60 * 34,  name: 'CAMPFIRE'  },
-        { key: 'barn',   need: 70,  x: 432,  y: 320, w: 104, h: 132, crew: 6, work: 60 * 150, name: 'BARN'      },
-        { key: 'castle', need: 150, x: 752,  y: 372, w: 130, h: 132, crew: 8, work: 60 * 230, name: 'CASTLE'    },
-        { key: 'plane',  need: 200, x: 640,  y: 660, w: 86,  h: 52,  crew: 6, work: 60 * 140, name: 'AEROPLANE' },
+        { id: 'coop',   key: 'coop',   need: 20,  x: 148,  y: 336, w: 78,  h: 108, crew: 4, work: 60 * 78,  name: 'HEN HOUSE' },
+        { id: 'fire',   key: 'fire',   need: 40,  x: 1122, y: 470, w: 34,  h: 34,  crew: 3, work: 60 * 34,  name: 'CAMPFIRE'  },
+        { id: 'barn',   key: 'barn',   need: 70,  x: 432,  y: 320, w: 104, h: 132, crew: 6, work: 60 * 150, name: 'BARN'      },
+        { id: 'castle', key: 'castle', need: 150, x: 752,  y: 372, w: 130, h: 132, crew: 8, work: 60 * 230, name: 'CASTLE'    },
+        { id: 'plane',  key: 'plane',  need: 200, x: 640,  y: 660, w: 86,  h: 52,  crew: 6, work: 60 * 140, name: 'AEROPLANE' },
     ];
 
-    // "a barn" but "an aeroplane"
-    function article(name) { return 'AEIOU'.includes(name[0]) ? 'AN ' : 'A '; }
+    // ...and once they have one of everything they simply build MORE houses,
+    // for as long as there is room in the yard for them. More houses means
+    // more beds, and a hen in a bed is a hen nothing can eat.
+    const EXTRA_KINDS = [
+        { key: 'barn',   w: 104, h: 132, crew: 6, work: 60 * 120, name: 'BARN'      },
+        { key: 'castle', w: 130, h: 132, crew: 8, work: 60 * 170, name: 'CASTLE'    },
+        { key: 'barn',   w: 104, h: 132, crew: 6, work: 60 * 120, name: 'BARN'      },
+        { key: 'coop',   w: 78,  h: 108, crew: 4, work: 60 * 70,  name: 'HEN HOUSE' },
+    ];
+    const EXTRA_FIRST = 215, EXTRA_STEP = 26;
+    let extraBuilds = 0;
+
+    // Somewhere in the yard with elbow room either side. Two rows, so the
+    // farm fills up front-to-back rather than in one long line.
+    function findSite(w) {
+        const bands = [372, 470];
+        for (let t = 0; t < 90; t++) {
+            let y = bands[(Math.random() * bands.length) | 0];
+            let x = 120 + Math.random() * (canvas.width - 240);
+            let clear = true;
+            for (let pr of projects) {
+                if (Math.abs(pr.y - y) < 80 && Math.abs(pr.x - x) < pr.spec.w + w + 54) { clear = false; break; }
+            }
+            if (clear) return { x: Math.round(x), y: y };
+        }
+        return null;   // yard's full for now -- it'll try again as things change
+    }
+
+    // The next thing worth starting, or null if it isn't time yet.
+    function nextProject() {
+        for (let spec of PROJECT_SPECS) {
+            if (projects.some(pr => pr.id === spec.id)) continue;
+            return chickens.length >= spec.need ? spec : null;   // strictly in order
+        }
+        if (chickens.length < EXTRA_FIRST + extraBuilds * EXTRA_STEP) return null;
+        let kind = EXTRA_KINDS[extraBuilds % EXTRA_KINDS.length];
+        let at = findSite(kind.w);
+        if (!at) return null;
+        extraBuilds++;
+        return Object.assign({}, kind, { id: 'extra' + extraBuilds, need: 0, x: at.x, y: at.y, extra: true });
+    }
+
+    // "a barn", but "an aeroplane", and "another barn" for the later ones
+    function projectWords(spec) {
+        if (spec.extra) return 'ANOTHER ' + spec.name;
+        return ('AEIOU'.includes(spec.name[0]) ? 'AN ' : 'A ') + spec.name;
+    }
 
     // Let a chicken go back to being an ordinary chicken.
     function releaseJob(c) {
@@ -3235,6 +3304,7 @@
         c.job = null; c.site = null;
         c.hidden = false; c.safe = false;
         c.sitting = false; c.atPost = false;
+        c.stayCd = 0;
         if (c.state !== 'exodus' && c.state !== 'toCoop') c.state = 'wander';
     }
 
@@ -3324,6 +3394,30 @@
         ctx.beginPath(); ctx.arc(s * 1.7, -s * 0.6, s * 0.25, 0, Math.PI * 2); ctx.fill();
     }
 
+    // Coursed rubble masonry. Each block's shade comes from a hash of where
+    // it sits, so the wall looks hand-laid but never flickers between frames.
+    const STONE = ['#8e8e85', '#9b9b91', '#83837a', '#94948b', '#7c7c74', '#a0a096'];
+    function stoneWall(x0, y0, w, h, seed) {
+        ctx.fillStyle = '#63635c';                 // mortar showing through
+        ctx.fillRect(x0, y0, w, h);
+        const CH = 12, BW = 25;
+        let rows = Math.ceil(h / CH);
+        for (let r = 0; r < rows; r++) {
+            let ry = y0 + r * CH;
+            let rh = Math.min(CH, y0 + h - ry) - 1.3;
+            if (rh <= 0.4) continue;
+            let off = (r % 2) ? BW * 0.5 : 0;
+            for (let bx = x0 - off; bx < x0 + w; bx += BW) {
+                let px = Math.max(x0, bx);
+                let pw = Math.min(bx + BW - 1.3, x0 + w) - px;
+                if (pw <= 0.6) continue;
+                let hsh = Math.sin((seed + r * 37 + Math.round(bx) * 13) * 12.9898) * 43758.5453;
+                ctx.fillStyle = STONE[((hsh - Math.floor(hsh)) * STONE.length) | 0];
+                ctx.fillRect(px, ry, pw, rh);
+            }
+        }
+    }
+
     // A properly flickery campfire, drawn in three layers
     function drawFlame(x, y, s, t) {
         ctx.globalAlpha = 0.2 + Math.sin(t * 0.21) * 0.06;
@@ -3346,7 +3440,7 @@
 
     class Project {
         constructor(spec) {
-            this.spec = spec; this.key = spec.key;
+            this.spec = spec; this.key = spec.key; this.id = spec.id;
             this.x = spec.x; this.y = spec.y;
             this.work = 0;
             this.done = false;
@@ -3379,6 +3473,7 @@
                     c.job = job; c.site = this;
                     c.releaseFood();
                     if (job === 'build') { c.tool = (Math.random() * 5) | 0; c.workCycle = Math.random() * 6; }
+                    c.stayCd = 60 * (SHIFT[job][0] + Math.random() * SHIFT[job][1]);
                     // indoors means out of reach of anything with teeth
                     if (job === 'inside' || job === 'patrol') {
                         c.hidden = true; c.safe = true;
@@ -3427,7 +3522,7 @@
             this.pop = 70;
             for (let c of this.crew.slice()) releaseJob(c);
             this.crew.length = 0;
-            showBanner('THEY BUILT ' + article(this.spec.name) + this.spec.name + '!', '#ffd23b');
+            showBanner('THEY BUILT ' + projectWords(this.spec) + '!', '#ffd23b');
             sndFanfare();
             addScore(500);
             spawnConfetti(45);
@@ -3649,72 +3744,116 @@
             ctx.restore();
         }
 
-        // --- the castle ---
+        // --- the castle: proper medieval masonry ---
+        // Every stone is picked from a fixed hash of its position, so the
+        // wall keeps the same face frame after frame instead of shimmering.
         drawCastle() {
             let x = this.x, y = this.y;
             drawShadow(x, y, 106, 22);
             const WALL = y - 64;
+            const seed = (x * 7 + y) | 0;
+
             // curtain wall
-            ctx.fillStyle = '#9aa0a8'; ctx.fillRect(x - 92, WALL, 184, 66);
-            ctx.fillStyle = '#868d95'; ctx.fillRect(x - 92, WALL, 184, 8);
-            // crenellations
-            ctx.fillStyle = '#9aa0a8';
-            for (let i = 0; i < 9; i++) ctx.fillRect(x - 92 + i * 21, WALL - 11, 13, 11);
-            // stonework
-            ctx.strokeStyle = 'rgba(90,96,104,0.5)'; ctx.lineWidth = 1;
-            for (let r = 0; r < 4; r++) {
-                ctx.beginPath(); ctx.moveTo(x - 92, WALL + 14 + r * 14); ctx.lineTo(x + 92, WALL + 14 + r * 14); ctx.stroke();
-                for (let cbl = 0; cbl < 7; cbl++) {
-                    let bx = x - 92 + cbl * 26 + (r % 2 ? 13 : 0);
-                    ctx.beginPath(); ctx.moveTo(bx, WALL + 14 + r * 14); ctx.lineTo(bx, WALL + 28 + r * 14); ctx.stroke();
-                }
-            }
+            stoneWall(x - 92, WALL, 184, 66, seed);
+            // machicolations -- the corbelled overhang under the parapet
+            ctx.fillStyle = '#7e7e75';
+            ctx.fillRect(x - 96, WALL - 5, 192, 6);
+            ctx.fillStyle = '#66665f';
+            for (let i = 0; i < 24; i++) ctx.fillRect(x - 94 + i * 8, WALL - 5, 4, 6);
+            // battlements
+            for (let i = 0; i < 9; i++) stoneWall(x - 92 + i * 21, WALL - 16, 13, 11, seed + i * 17);
+
             // towers
             for (let sgn = -1; sgn <= 1; sgn += 2) {
                 let tx = x + sgn * 92;
-                ctx.fillStyle = '#a8aeb6'; ctx.fillRect(tx - 20, y - 98, 40, 100);
-                ctx.fillStyle = '#8f959d';
-                for (let i = 0; i < 3; i++) ctx.fillRect(tx - 20 + i * 15, y - 109, 10, 11);
-                // conical roof
-                ctx.fillStyle = '#3f6fa8';
+                stoneWall(tx - 20, y - 98, 40, 100, seed + sgn * 91);
+                // corbel course under the tower crown
+                ctx.fillStyle = '#7e7e75';
+                ctx.fillRect(tx - 24, y - 103, 48, 5);
+                // tower battlements
+                for (let i = 0; i < 3; i++) stoneWall(tx - 20 + i * 15, y - 113, 10, 11, seed + i * 41 + sgn);
+                // slate roof, with courses of tiles
+                ctx.fillStyle = '#49525c';
                 ctx.beginPath();
-                ctx.moveTo(tx - 26, y - 109); ctx.lineTo(tx, y - 146); ctx.lineTo(tx + 26, y - 109);
+                ctx.moveTo(tx - 26, y - 113); ctx.lineTo(tx, y - 150); ctx.lineTo(tx + 26, y - 113);
                 ctx.closePath(); ctx.fill();
-                ctx.fillStyle = '#2f568a';
+                ctx.strokeStyle = 'rgba(28,34,42,0.55)'; ctx.lineWidth = 1;
+                for (let r = 1; r < 5; r++) {
+                    let ry = y - 113 - r * 7.2, hw = 26 * (1 - r / 5.15);
+                    ctx.beginPath(); ctx.moveTo(tx - hw, ry); ctx.lineTo(tx + hw, ry); ctx.stroke();
+                }
+                ctx.fillStyle = 'rgba(255,255,255,0.10)';
                 ctx.beginPath();
-                ctx.moveTo(tx - 26, y - 109); ctx.lineTo(tx, y - 128); ctx.lineTo(tx + 26, y - 109);
+                ctx.moveTo(tx - 26, y - 113); ctx.lineTo(tx, y - 150); ctx.lineTo(tx - 4, y - 113);
                 ctx.closePath(); ctx.fill();
-                // arrow slit
-                ctx.fillStyle = '#2a2f36'; ctx.fillRect(tx - 3, y - 88, 6, 16);
+                // narrow arrow loop with its splayed sill
+                ctx.fillStyle = '#2a2f36';
+                ctx.fillRect(tx - 2, y - 88, 4, 15);
+                ctx.fillRect(tx - 5, y - 78, 10, 4);
             }
-            // gatehouse arch
-            ctx.fillStyle = '#2a2118';
+
+            // gatehouse: a round-headed arch of wedge-shaped voussoir stones
+            ctx.fillStyle = '#241d16';
             ctx.beginPath(); ctx.arc(x, y - 30, 20, Math.PI, 0); ctx.fill();
             ctx.fillRect(x - 20, y - 30, 40, 32);
-            // wooden gate with iron bands
-            ctx.fillStyle = '#7a5330';
-            ctx.beginPath(); ctx.arc(x, y - 30, 18, Math.PI, 0); ctx.fill();
-            ctx.fillRect(x - 18, y - 30, 36, 32);
-            ctx.strokeStyle = '#4b4b4b'; ctx.lineWidth = 3;
-            ctx.beginPath();
-            ctx.moveTo(x - 18, y - 20); ctx.lineTo(x + 18, y - 20);
-            ctx.moveTo(x - 18, y - 6); ctx.lineTo(x + 18, y - 6);
-            ctx.stroke();
-            // flag, waving
+            ctx.strokeStyle = '#a5a59a'; ctx.lineWidth = 7;
+            ctx.beginPath(); ctx.arc(x, y - 30, 23.5, Math.PI, 0); ctx.stroke();
+            ctx.strokeStyle = '#70706a'; ctx.lineWidth = 1;
+            for (let i = 0; i <= 7; i++) {
+                let a = Math.PI + (i / 7) * Math.PI;
+                ctx.beginPath();
+                ctx.moveTo(x + Math.cos(a) * 20, y - 30 + Math.sin(a) * 20);
+                ctx.lineTo(x + Math.cos(a) * 27, y - 30 + Math.sin(a) * 27);
+                ctx.stroke();
+            }
+            // jambs either side of the opening
+            ctx.fillStyle = '#a5a59a';
+            ctx.fillRect(x - 27, y - 30, 7, 32);
+            ctx.fillRect(x + 20, y - 30, 7, 32);
+
+            // studded oak gate
+            ctx.fillStyle = '#6b4a2a';
+            ctx.beginPath(); ctx.arc(x, y - 28, 17, Math.PI, 0); ctx.fill();
+            ctx.fillRect(x - 17, y - 28, 34, 30);
+            ctx.strokeStyle = '#54381f'; ctx.lineWidth = 1;
+            for (let i = -3; i <= 3; i++) {
+                ctx.beginPath(); ctx.moveTo(x + i * 5, y - 42); ctx.lineTo(x + i * 5, y + 2); ctx.stroke();
+            }
+            ctx.fillStyle = '#3d4148';
+            ctx.fillRect(x - 17, y - 20, 34, 4);
+            ctx.fillRect(x - 17, y - 6, 34, 4);
+            ctx.fillStyle = '#5e646c';
+            for (let i = -3; i <= 3; i++) {
+                ctx.fillRect(x + i * 5 - 1, y - 19, 2, 2);
+                ctx.fillRect(x + i * 5 - 1, y - 5, 2, 2);
+            }
+            // portcullis, half lowered
+            ctx.strokeStyle = 'rgba(58,62,70,0.85)'; ctx.lineWidth = 2;
+            for (let i = -2; i <= 2; i++) {
+                ctx.beginPath(); ctx.moveTo(x + i * 8, y - 44); ctx.lineTo(x + i * 8, y - 32); ctx.stroke();
+            }
+            ctx.beginPath(); ctx.moveTo(x - 18, y - 34); ctx.lineTo(x + 18, y - 34); ctx.stroke();
+
+            // a bit of weathering, so it doesn't read as brand new
+            ctx.fillStyle = 'rgba(96,120,72,0.16)';
+            ctx.beginPath(); ctx.ellipse(x - 62, y - 6, 24, 9, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(x + 48, y - 4, 18, 7, 0, 0, Math.PI * 2); ctx.fill();
+
+            // banner on the left tower
             let fx = x - 92, ft = frameCount * 0.09;
-            ctx.strokeStyle = '#5c4033'; ctx.lineWidth = 2;
-            ctx.beginPath(); ctx.moveTo(fx, y - 146); ctx.lineTo(fx, y - 176); ctx.stroke();
-            ctx.fillStyle = '#e03b5a';
+            ctx.strokeStyle = '#4a3a28'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(fx, y - 150); ctx.lineTo(fx, y - 180); ctx.stroke();
+            ctx.fillStyle = '#a32436';
             ctx.beginPath();
-            ctx.moveTo(fx, y - 176);
-            ctx.quadraticCurveTo(fx + 16, y - 174 + Math.sin(ft) * 4, fx + 32, y - 170 + Math.sin(ft + 1) * 5);
-            ctx.lineTo(fx + 32, y - 156 + Math.sin(ft + 1) * 5);
-            ctx.quadraticCurveTo(fx + 16, y - 160 + Math.sin(ft) * 4, fx, y - 162);
+            ctx.moveTo(fx, y - 180);
+            ctx.quadraticCurveTo(fx + 16, y - 178 + Math.sin(ft) * 4, fx + 32, y - 174 + Math.sin(ft + 1) * 5);
+            ctx.lineTo(fx + 32, y - 160 + Math.sin(ft + 1) * 5);
+            ctx.quadraticCurveTo(fx + 16, y - 164 + Math.sin(ft) * 4, fx, y - 166);
             ctx.closePath(); ctx.fill();
-            // a tiny chicken on the flag
-            ctx.fillStyle = '#fff2c8';
+            // the family crest: a chicken, obviously
+            ctx.fillStyle = '#f0e2b8';
             ctx.beginPath();
-            ctx.moveTo(fx + 24, y - 166); ctx.lineTo(fx + 13, y - 171); ctx.lineTo(fx + 14, y - 162);
+            ctx.moveTo(fx + 25, y - 170); ctx.lineTo(fx + 13, y - 175); ctx.lineTo(fx + 15, y - 165);
             ctx.closePath(); ctx.fill();
         }
         drawCastleLife() {
@@ -3726,11 +3865,11 @@
                 let ph = (frameCount * 0.0035 + i / Math.max(1, this.patrol.length)) % 1;
                 let tri = ph < 0.5 ? ph * 2 : 2 - ph * 2;
                 let px = x - 78 + tri * 156;
-                drawMiniChicken(px, WALL - 11, 7.5, ph < 0.5 ? 1 : -1, frameCount * 0.24 + i,
+                drawMiniChicken(px, WALL - 14, 7.5, ph < 0.5 ? 1 : -1, frameCount * 0.24 + i,
                                 c.crazy ? c.bodyColor : '#ffffff');
                 // a pitchfork over the shoulder
                 ctx.save();
-                ctx.translate(px + (ph < 0.5 ? 4 : -4), WALL - 13);
+                ctx.translate(px + (ph < 0.5 ? 4 : -4), WALL - 16);
                 ctx.scale(ph < 0.5 ? 1 : -1, 1);
                 ctx.rotate(-0.25);
                 drawPitchfork(8);
@@ -3742,8 +3881,8 @@
                 let bob = Math.sin(frameCount * 0.05 + i * 1.3) * 2;
                 let c = this.residents[i];
                 ctx.save();
-                ctx.beginPath(); ctx.rect(hx - 9, WALL - 22, 18, 22); ctx.clip();
-                drawMiniChicken(hx, WALL - 1 + bob, 7, i % 2 ? 1 : -1, 0,
+                ctx.beginPath(); ctx.rect(hx - 9, WALL - 27, 18, 22); ctx.clip();
+                drawMiniChicken(hx, WALL - 6 + bob, 7, i % 2 ? 1 : -1, 0,
                                 c.crazy ? c.bodyColor : '#ffffff');
                 ctx.restore();
             }
@@ -3960,16 +4099,13 @@
 
     // --- Keeping all the hobbies staffed ---
     function updateProjects() {
-        // one build at a time, in order, so the crew is never split
+        // one build at a time, so the crew is never split between two sites
         if (!projects.some(pr => !pr.done)) {
-            for (let spec of PROJECT_SPECS) {
-                if (projects.some(pr => pr.key === spec.key)) continue;
-                if (chickens.length >= spec.need) {
-                    projects.push(new Project(spec));
-                    showBanner('BUILDING ' + article(spec.name) + spec.name + '!', '#ffd23b');
-                    sndSparkle();
-                    break;
-                }
+            let spec = nextProject();
+            if (spec) {
+                projects.push(new Project(spec));
+                showBanner('BUILDING ' + projectWords(spec) + '!', '#ffd23b');
+                sndSparkle();
             }
         }
         for (let pr of projects) pr.update();
@@ -3985,6 +4121,7 @@
                     let c = chickens[(Math.random() * n) | 0];
                     if (!idleHen(c)) continue;
                     c.job = 'guard'; c.guardCd = 0; c.jab = 0;
+                    c.stayCd = 60 * (SHIFT.guard[0] + Math.random() * SHIFT.guard[1]);
                     c.patrolT = Math.random() * 6.283;
                     c.releaseFood();
                     guards.push(c);
@@ -4011,6 +4148,7 @@
                         if (!idleHen(c)) continue;
                         if (dist(c.x, c.y, ball.x, ball.y) > 320) continue;
                         c.job = 'soccer'; c.releaseFood(); squad++;
+                        c.stayCd = 60 * (SHIFT.soccer[0] + Math.random() * SHIFT.soccer[1]);
                     }
                 }
             }
@@ -4152,11 +4290,12 @@
         bolts = []; grasses = []; rabbits = []; poops = []; flies = [];
         confetti = []; coop = null; chickensHoused = 0;
         farmers = []; angels = []; scorches = [];
-        projects = []; guards = []; guardsAnnounced = false;
+        projects = []; guards = []; guardsAnnounced = false; extraBuilds = 0;
         ball = null; plane = null;
         nextPredAt = frameCount + 60 * 26;
         nextFarmerAt = frameCount + 60 * 44;
         nextStampedeAt = frameCount + 60 * 50;
+        bigSackAnnounced = false;
         score = 0; scorePop = 0;
         chickensLost = 0; foxesZapped = 0; chickensStarved = 0; chickensVaporised = 0;
         grassStolen = 0; cowMeals = 0; crazyDeparted = 0;
@@ -4533,8 +4672,9 @@
         for (let c of chickens) if (c.job) jobN++;
         let nextUp = null;
         for (let spec of PROJECT_SPECS) {
-            if (!projects.some(pr => pr.key === spec.key)) { nextUp = spec; break; }
+            if (!projects.some(pr => pr.id === spec.id)) { nextUp = spec; break; }
         }
+        let moreAt = EXTRA_FIRST + extraBuilds * EXTRA_STEP;
         let lines = [
             ['CHICKENS ' + chickens.length + (crazyN ? '  (' + crazyN + ' CRAZY)' : ''),
                 crazyN ? '#ff6bcb' : '#FFD700'],
@@ -4546,7 +4686,7 @@
             ['SCARED OFF ' + foxesZapped + '   FLEW AWAY ' + crazyDeparted, '#9ad8ff'],
             ['AT WORK ' + jobN + '   SAFE INDOORS ' + safeN, '#ffd8a0'],
             [building ? 'BUILDING ' + building.spec.name + ' ' + Math.round(building.t * 100) + '%'
-                      : (nextUp ? 'NEXT BUILD AT ' + nextUp.need + ' CHICKENS' : 'ALL BUILT!'),
+                      : 'NEXT BUILD AT ' + (nextUp ? nextUp.need : moreAt) + ' CHICKENS',
                 building ? '#ffd23b' : '#c8d0d8'],
             ['HORSE: ' + horseSizeLabel(horsePlump), horsePlump > 0.75 ? '#ffb060' : '#e0b080']
         ];
@@ -4834,6 +4974,13 @@
         if (frameCount >= nextFarmerAt) {
             if (farmers.length === 0) farmers.push(new Farmer());
             nextFarmerAt = frameCount + 60 * (48 + Math.random() * 40);
+        }
+
+        // Fifty hungry beaks means bigger sacks of corn
+        if (!bigSackAnnounced && chickens.length >= BIG_SACK_AT) {
+            bigSackAnnounced = true;
+            showBanner('BIGGER SACKS OF CORN!', '#ffd23b');
+            sndSparkle();
         }
 
         // Everything the flock has decided to do with its spare time
