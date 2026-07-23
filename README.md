@@ -36,14 +36,15 @@ needs more chickens than the last one:
 | 132 | a **merry-go-round**, with painted horses that go up and down |
 | 164 | a castle -- six chickens patrol the battlements, ten shelter inside where nothing can eat them |
 | 196 | a **ferris wheel**, eight gondolas, riders in every one |
-| 228 | an aeroplane, which they fly around the sky trailing a banner, for no reason |
-| 252+ | **another house**, and then another, and another, for as long as there is room in the yard |
+| 216 | a **roller coaster** -- a cute little wooden one, chain lift, three hills, a train of three cars, and riders who throw their wings in the air on the drops |
+| 244 | an aeroplane, which they fly around the sky trailing a banner, for no reason |
+| 268+ | **another house**, and then another, and another, for as long as there is room in the yard |
 
 There is no limit on how many houses go up -- only on how much space is left.
 More houses means more beds, and a hen in a bed is a hen nothing can eat.
 
-But there is nothing to eat in a house, and nothing to eat on a ferris
-wheel either. A hen indoors or on a ride does not gain an ounce -- every job
+But there is nothing to eat in a house, and nothing to eat on a roller
+coaster either. A hen indoors or on a ride does not gain an ounce -- every job
 is a shift, and when it ends she comes back out to find some corn and lets
 somebody else have her turn.
 
