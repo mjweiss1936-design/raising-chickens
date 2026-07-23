@@ -1,21 +1,19 @@
 # Farm Yard Chaos
 
-A little browser game. Raise a flock of plump chickens without losing them
-to the fox, the wolf, the alligator, the angry farmer, the mud or the thorns.
+A silly little browser game. Feed your chickens until they're plump, and zap
+the visiting animals with lightning to shoo them away.
 
 **Play it:** open `index.html`, or visit the GitHub Pages link.
 
 ## How to play
 
-- **Click the grass** to drop a handful of corn. Where you drop it is the whole game.
-- Red rings are **deadly**. Corn dropped in one lures the hens to their death.
-- Hens are not clever. If you stop feeding them they wander into trouble on their own.
-- **P** calls down lightning and scares off every fox on the field (long recharge).
+- **SPACEBAR or click** to throw a handful of corn. Hold space to keep feeding.
+- Click a spot to aim the corn there, if you like.
+- **P** (or the bolt button) calls down lightning and scares off **every** animal
+  on the farm -- foxes, the wolf, the alligator, the angry farmer, even the bear.
 - **F** fullscreen, **M** mute, **N** music on/off (starts off).
-- You pick **EASY or HARD** on the opening screen, and can switch any time
-  with the on-screen button or the **E** key.
 
-Goal: get 6 plump chickens at once (7 on hard) and they all march into the coop.
+Goal: get 6 plump chickens at once and they all march into the coop.
 
 ## Files
 
