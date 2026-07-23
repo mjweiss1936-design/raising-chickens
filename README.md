@@ -28,19 +28,29 @@ needs more chickens than the last one:
 | 20 | a hen house |
 | 40 | a campfire, and sit round it toasting marshmallows |
 | 50 | (bigger sacks of corn -- fifty beaks need feeding) |
-| 70 | a barn, and move in -- you can watch them pacing about inside |
+| 58 | a **market stall**, where chickens queue up and buy themselves a beakful of corn |
+| 78 | a barn, and move in -- you can watch them pacing about inside |
 | 100 | (a football falls out of the sky and they start kicking it about) |
+| 102 | a **house**. A proper one, for a person. Half-timbered, tiled roof, smoking chimney, flowers in the window boxes. They live in it. |
 | 110 | a pitchfork patrol that charges predators and often sees them off |
-| 150 | a castle -- six chickens patrol the battlements, ten shelter inside where nothing can eat them |
-| 200 | an aeroplane, which they fly around the sky trailing a banner, for no reason |
-| 215+ | **another house**, and then another, and another, for as long as there is room in the yard |
+| 132 | a **merry-go-round**, with painted horses that go up and down |
+| 164 | a castle -- six chickens patrol the battlements, ten shelter inside where nothing can eat them |
+| 196 | a **ferris wheel**, eight gondolas, riders in every one |
+| 228 | an aeroplane, which they fly around the sky trailing a banner, for no reason |
+| 252+ | **another house**, and then another, and another, for as long as there is room in the yard |
 
 There is no limit on how many houses go up -- only on how much space is left.
 More houses means more beds, and a hen in a bed is a hen nothing can eat.
 
-But there is nothing to eat indoors. A hen tucked up in a house does not
-gain an ounce; every job is a shift, and when it ends she comes back out to
-find some corn and lets somebody else have her bed.
+But there is nothing to eat in a house, and nothing to eat on a ferris
+wheel either. A hen indoors or on a ride does not gain an ounce -- every job
+is a shift, and when it ends she comes back out to find some corn and lets
+somebody else have her turn.
+
+The one exception is the market stall, which is the whole point of it: a
+chicken queues up, gets served, and comes away a little plumper. It shifts
+about 37 customers a minute. It is a trickle next to a sack of corn thrown
+by you, but it never stops.
 
 Every build gets a proper site: hard hats, hammers, saws, planks, a paint
 roller, scaffolding, a crane with a plank swinging off it, hazard tape and a

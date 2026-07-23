@@ -708,6 +708,19 @@
         return best ? { obj: best, d: bestD } : null;
     }
 
+    // Feeding a hen is the same event wherever the food came from: she fills
+    // out, she may cross into plump for the first time, and a full hen lays.
+    function feedHen(c, amount) {
+        c.fatness = Math.min(MAX_FATNESS, c.fatness + amount);
+        if (!c.countedPlump && c.fatness >= PLUMP_THRESHOLD) {
+            c.countedPlump = true;
+            addScore(150);
+            sndSparkle();
+            for (let k = 0; k < 4; k++) heart(c.x + (Math.random() - 0.5) * 20, c.y - c.size);
+        }
+        if (c.fatness >= FAT_LAY_THRESHOLD && c.layCd <= 0) c.layClutch();
+    }
+
     // Is this bird available to be chased and eaten? Anyone tucked up inside
     // the castle, off with the bear, or marching to the coop is off the menu.
     function huntable(c) {
@@ -996,6 +1009,7 @@
             this.jab = 0;
             this.stayCd = 0;      // frames left on this shift
             this.jobCd = 0;       // must go and eat before taking another one
+            this.shopCd = 0;      // time left at the front of the market queue
 
             // Each bird keeps its own patch of yard and mooches around it, so
             // the flock spreads out instead of orbiting one spot.
@@ -1148,7 +1162,8 @@
                     this.jobCd = 60 * (9 + Math.random() * 9);   // off to find her supper
                     releaseJob(this);
                 } else {
-                    if (this.job === 'inside' || this.job === 'patrol') return;  // the building runs them
+                    // indoors, on the wall, or going round on a ride: the building runs them
+                    if (this.job === 'inside' || this.job === 'patrol' || this.job === 'ride') return;
                     if (this.updateJob()) return;
                 }
             }
@@ -1251,18 +1266,8 @@
                         if (Math.random() < 0.10) sndCluck();
                         addScore(2); // a little something for every bite
                         // Get fatter -- very, very slowly. Cap at 2.2
-                        this.fatness = Math.min(MAX_FATNESS, this.fatness + FATTEN_PER_KERNEL);
                         if (Math.random() < 0.15) heart(this.x, this.y - this.size);
-                        // First time it crosses into "plump" -- a big reward, this
-                        // is what the whole game is about.
-                        if (!this.countedPlump && this.fatness >= PLUMP_THRESHOLD) {
-                            this.countedPlump = true;
-                            addScore(150);
-                            sndSparkle();
-                            for (let k = 0; k < 4; k++) heart(this.x + (Math.random() - 0.5) * 20, this.y - this.size);
-                        }
-                        // Plump enough? Time to lay.
-                        if (this.fatness >= FAT_LAY_THRESHOLD && this.layCd <= 0) this.layClutch();
+                        feedHen(this, FATTEN_PER_KERNEL);
                     }
                     this.state = 'wander'; this.targetFood = null; this.timer = 20;
                 }
@@ -1350,6 +1355,7 @@
             if (this.job === 'guard')  return this.doGuard();
             if (this.job === 'sit')    return this.doSit();
             if (this.job === 'soccer') return this.doSoccer();
+            if (this.job === 'shop')   return this.doShop();
             return false;
         }
 
@@ -1434,6 +1440,36 @@
                 this.walkCycle = 0;
                 this.workCycle += 0.05;
                 this.face(site.x - this.x);
+            }
+            return true;
+        }
+
+        // Queue at the stall, pay for a beakful, toddle off happy.
+        doShop() {
+            let site = this.site;
+            if (!site || !site.done) { releaseJob(this); return false; }
+            if (this.jobScared()) { releaseJob(this); return false; }
+            let p = site.queuePos(this.slot);
+            if (dist(this.x, this.y, p.x, p.y) > 8) {
+                this.moveTo(p.x, p.y, this.baseSpeed);
+                this.walkCycle += 0.26;
+                return true;
+            }
+            this.walkCycle = 0;
+            this.face(site.x - this.x);
+            if (this.slot !== 0) return true;          // still waiting your turn
+            if (site.stock < 1) { this.shopCd = 30; return true; }   // sold out for a moment
+            if (this.shopCd <= 0) { this.shopCd = 75; return true; } // being served
+            if (--this.shopCd <= 0) {
+                site.stock--;
+                feedHen(this, MARKET_MEAL);
+                heart(this.x, this.y - this.size);
+                puff(this.x, this.y - 10, 4, '#ffe14d', 1.2);
+                addScore(15);
+                sndPeck();
+                this.jobCd = 60 * (5 + Math.random() * 5);
+                releaseJob(this);
+                return false;
             }
             return true;
         }
@@ -3231,15 +3267,29 @@
         patrol: [26, 16],
         sit:    [24, 18],
         guard:  [34, 22],
-        soccer: [26, 20]
+        soccer: [26, 20],
+        ride:   [20, 16],   // a few turns of the wheel, then off to find lunch
+        shop:   [45, 15]    // only a backstop -- they leave once they're served
     };
+
+    // The market: chickens queue up, buy a beakful and toddle off happy. It is
+    // a trickle next to a sack of corn, but it is never nothing.
+    const MARKET_STOCK = 20;          // sacks on the stall
+    const MARKET_RESTOCK = 72;        // a fresh sack every 1.2s -- fast enough
+                                      // to keep the queue actually moving
+    const MARKET_MEAL = 0.14;         // roughly a dozen kernels' worth
+    const MARKET_QUEUE = 4;
 
     const PROJECT_SPECS = [
         { id: 'coop',   key: 'coop',   need: 20,  x: 148,  y: 336, w: 78,  h: 108, crew: 4, work: 60 * 78,  name: 'HEN HOUSE' },
         { id: 'fire',   key: 'fire',   need: 40,  x: 1122, y: 470, w: 34,  h: 34,  crew: 3, work: 60 * 34,  name: 'CAMPFIRE'  },
-        { id: 'barn',   key: 'barn',   need: 70,  x: 432,  y: 320, w: 104, h: 132, crew: 6, work: 60 * 150, name: 'BARN'      },
-        { id: 'castle', key: 'castle', need: 150, x: 752,  y: 372, w: 130, h: 132, crew: 8, work: 60 * 230, name: 'CASTLE'    },
-        { id: 'plane',  key: 'plane',  need: 200, x: 640,  y: 660, w: 86,  h: 52,  crew: 6, work: 60 * 140, name: 'AEROPLANE' },
+        { id: 'market', key: 'market', need: 58,  x: 286,  y: 512, w: 58,  h: 92,  crew: 4, work: 60 * 92,  name: 'MARKET STALL' },
+        { id: 'barn',   key: 'barn',   need: 78,  x: 432,  y: 320, w: 104, h: 132, crew: 6, work: 60 * 150, name: 'BARN'      },
+        { id: 'house',  key: 'house',  need: 102, x: 1006, y: 330, w: 76,  h: 116, crew: 5, work: 60 * 118, name: 'HOUSE'     },
+        { id: 'ride',   key: 'ride',   need: 132, x: 588,  y: 508, w: 66,  h: 106, crew: 5, work: 60 * 124, name: 'MERRY-GO-ROUND' },
+        { id: 'castle', key: 'castle', need: 164, x: 752,  y: 372, w: 130, h: 132, crew: 8, work: 60 * 230, name: 'CASTLE'    },
+        { id: 'ferris', key: 'ferris', need: 196, x: 906,  y: 556, w: 84,  h: 124, crew: 6, work: 60 * 168, name: 'FERRIS WHEEL' },
+        { id: 'plane',  key: 'plane',  need: 228, x: 640,  y: 672, w: 86,  h: 52,  crew: 6, work: 60 * 140, name: 'AEROPLANE' },
     ];
 
     // ...and once they have one of everything they simply build MORE houses,
@@ -3247,17 +3297,17 @@
     // more beds, and a hen in a bed is a hen nothing can eat.
     const EXTRA_KINDS = [
         { key: 'barn',   w: 104, h: 132, crew: 6, work: 60 * 120, name: 'BARN'      },
+        { key: 'house',  w: 76,  h: 116, crew: 5, work: 60 * 100, name: 'HOUSE'     },
         { key: 'castle', w: 130, h: 132, crew: 8, work: 60 * 170, name: 'CASTLE'    },
-        { key: 'barn',   w: 104, h: 132, crew: 6, work: 60 * 120, name: 'BARN'      },
         { key: 'coop',   w: 78,  h: 108, crew: 4, work: 60 * 70,  name: 'HEN HOUSE' },
     ];
-    const EXTRA_FIRST = 215, EXTRA_STEP = 26;
+    const EXTRA_FIRST = 252, EXTRA_STEP = 26;
     let extraBuilds = 0;
 
     // Somewhere in the yard with elbow room either side. Two rows, so the
     // farm fills up front-to-back rather than in one long line.
     function findSite(w) {
-        const bands = [372, 470];
+        const bands = [372, 470, 568];
         for (let t = 0; t < 90; t++) {
             let y = bands[(Math.random() * bands.length) | 0];
             let x = 120 + Math.random() * (canvas.width - 240);
@@ -3295,7 +3345,7 @@
         if (!c || !c.job) return;
         let st = c.site;
         if (st) {
-            for (let list of [st.crew, st.residents, st.patrol, st.sitters]) {
+            for (let list of [st.crew, st.residents, st.patrol, st.sitters, st.riders, st.shoppers]) {
                 let i = list.indexOf(c);
                 if (i >= 0) list.splice(i, 1);
             }
@@ -3304,7 +3354,7 @@
         c.job = null; c.site = null;
         c.hidden = false; c.safe = false;
         c.sitting = false; c.atPost = false;
-        c.stayCd = 0;
+        c.stayCd = 0; c.shopCd = 0;
         if (c.state !== 'exodus' && c.state !== 'toCoop') c.state = 'wander';
     }
 
@@ -3445,6 +3495,10 @@
             this.work = 0;
             this.done = false;
             this.crew = []; this.residents = []; this.patrol = []; this.sitters = [];
+            this.riders = []; this.shoppers = [];
+            this.spin = Math.random() * 6.283;      // rides turn from wherever
+            this.stock = MARKET_STOCK;              // sacks of corn on the stall
+            this.restock = 0;
             this.pop = 0;
             this.crane = Math.random() * 6;
         }
@@ -3502,10 +3556,19 @@
                 if (this.work >= this.spec.work) this.finish();
             } else {
                 if (this.key === 'barn') this.staff(this.residents, 'inside', 8);
+                else if (this.key === 'house') this.staff(this.residents, 'inside', 6);
                 else if (this.key === 'castle') {
                     this.staff(this.patrol, 'patrol', 6);
                     this.staff(this.residents, 'inside', 10);
                 } else if (this.key === 'fire') this.staff(this.sitters, 'sit', 6);
+                else if (this.key === 'ferris') { this.staff(this.riders, 'ride', 8); this.spin += 0.009; }
+                else if (this.key === 'ride')   { this.staff(this.riders, 'ride', 6); this.spin += 0.016; }
+                else if (this.key === 'market') {
+                    this.staff(this.shoppers, 'shop', MARKET_QUEUE);
+                    if (this.stock < MARKET_STOCK && --this.restock <= 0) {
+                        this.stock++; this.restock = MARKET_RESTOCK;
+                    }
+                }
                 // sparks off the fire
                 if (this.key === 'fire' && frameCount % 9 === 0) {
                     particles.push(new Particle(this.x + (Math.random() - 0.5) * 16, this.y - 6, {
@@ -3636,6 +3699,10 @@
             else if (this.key === 'barn') this.drawBarn();
             else if (this.key === 'castle') this.drawCastle();
             else if (this.key === 'fire') this.drawCampfire();
+            else if (this.key === 'house') this.drawHouse();
+            else if (this.key === 'market') this.drawMarket();
+            else if (this.key === 'ride') this.drawCarousel();
+            else if (this.key === 'ferris') this.drawFerris();
             else this.drawHangar();
         }
 
@@ -3643,6 +3710,12 @@
             if (this.key === 'barn') this.drawBarnLife();
             else if (this.key === 'castle') this.drawCastleLife();
             else if (this.key === 'coop') this.drawCoopLife();
+            else if (this.key === 'house') this.drawHouseLife();
+        }
+
+        // where the next customer in the queue should stand
+        queuePos(i) {
+            return { x: clampX(this.x - 8 - i * 25), y: clampY(this.y + 27 + i * 5) };
         }
 
         // --- a little hen house ---
@@ -3906,6 +3979,319 @@
             ctx.moveTo(x - 12, y - 5); ctx.lineTo(x + 14, y + 3);
             ctx.stroke(); ctx.lineCap = 'butt';
             if (this.done) drawFlame(x, y - 3, 1, frameCount);
+        }
+
+        // --- a proper little house, for a person, built by chickens ---
+        drawHouse() {
+            let x = this.x, y = this.y;
+            drawShadow(x, y, 54, 14);
+            // walls, with a rendered cream finish and a stone base course
+            ctx.fillStyle = '#f2e4c6'; ctx.fillRect(x - 48, y - 66, 96, 66);
+            ctx.fillStyle = '#e2d2b0'; ctx.fillRect(x + 20, y - 66, 28, 66);   // shaded gable end
+            ctx.fillStyle = '#9b9186'; ctx.fillRect(x - 48, y - 10, 96, 10);
+            // half-timbering
+            ctx.strokeStyle = '#6b4a2e'; ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(x - 48, y - 40); ctx.lineTo(x + 48, y - 40);
+            ctx.moveTo(x - 26, y - 66); ctx.lineTo(x - 26, y - 40);
+            ctx.moveTo(x + 26, y - 66); ctx.lineTo(x + 26, y - 40);
+            ctx.moveTo(x - 48, y - 40); ctx.lineTo(x - 26, y - 10);
+            ctx.moveTo(x + 48, y - 40); ctx.lineTo(x + 26, y - 10);
+            ctx.stroke();
+            // tiled roof, hanging over the walls
+            ctx.fillStyle = '#8c4a3a';
+            ctx.beginPath();
+            ctx.moveTo(x - 58, y - 62); ctx.lineTo(x, y - 104); ctx.lineTo(x + 58, y - 62);
+            ctx.closePath(); ctx.fill();
+            ctx.strokeStyle = 'rgba(70,32,24,0.5)'; ctx.lineWidth = 1;
+            for (let r = 1; r < 6; r++) {
+                let ry = y - 62 - r * 7, hw = 58 * (1 - r / 6.1);
+                ctx.beginPath(); ctx.moveTo(x - hw, ry); ctx.lineTo(x + hw, ry); ctx.stroke();
+            }
+            ctx.fillStyle = 'rgba(255,255,255,0.12)';
+            ctx.beginPath();
+            ctx.moveTo(x - 58, y - 62); ctx.lineTo(x, y - 104); ctx.lineTo(x - 6, y - 62);
+            ctx.closePath(); ctx.fill();
+            ctx.fillStyle = '#6d3729'; ctx.fillRect(x - 58, y - 64, 116, 4);
+            // brick chimney
+            ctx.fillStyle = '#a8574a'; ctx.fillRect(x + 26, y - 108, 15, 30);
+            ctx.fillStyle = '#8c4a3a'; ctx.fillRect(x + 24, y - 112, 19, 5);
+            ctx.strokeStyle = 'rgba(90,40,32,0.5)'; ctx.lineWidth = 1;
+            for (let r = 1; r < 4; r++) {
+                ctx.beginPath(); ctx.moveTo(x + 26, y - 108 + r * 7); ctx.lineTo(x + 41, y - 108 + r * 7); ctx.stroke();
+            }
+            // front door with a step and a knob
+            ctx.fillStyle = '#6b4a2a'; ctx.fillRect(x - 11, y - 36, 22, 36);
+            ctx.strokeStyle = '#54381f'; ctx.lineWidth = 1;
+            for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(x + i * 7, y - 36); ctx.lineTo(x + i * 7, y); ctx.stroke(); }
+            ctx.fillStyle = '#e8c24a';
+            ctx.beginPath(); ctx.arc(x + 6, y - 18, 1.8, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#9b9186'; ctx.fillRect(x - 15, y - 2, 30, 4);
+            // two windows, warmly lit, with glazing bars and boxes of flowers
+            for (let sgn = -1; sgn <= 1; sgn += 2) {
+                let wx = x + sgn * 31;
+                ctx.fillStyle = '#6b4a2e'; ctx.fillRect(wx - 13, y - 60, 26, 24);
+                ctx.fillStyle = '#ffd97a'; ctx.fillRect(wx - 11, y - 58, 22, 20);
+                ctx.strokeStyle = '#6b4a2e'; ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(wx, y - 58); ctx.lineTo(wx, y - 38);
+                ctx.moveTo(wx - 11, y - 48); ctx.lineTo(wx + 11, y - 48);
+                ctx.stroke();
+                ctx.fillStyle = '#7a5330'; ctx.fillRect(wx - 14, y - 36, 28, 6);
+                const petals = ['#e8506a', '#ffd23b', '#c58bff'];
+                for (let i = 0; i < 4; i++) {
+                    ctx.fillStyle = petals[i % 3];
+                    ctx.beginPath(); ctx.arc(wx - 10 + i * 7, y - 37, 2.6, 0, Math.PI * 2); ctx.fill();
+                }
+            }
+        }
+        drawHouseLife() {
+            let x = this.x, y = this.y;
+            // smoke curling out of the chimney
+            if (frameCount % 14 === 0) {
+                particles.push(new Particle(x + 33, y - 114, {
+                    z: 4, vx: 0.16 + Math.random() * 0.14, vy: -0.02,
+                    vz: 0.7 + Math.random() * 0.5, gravity: -0.006, life: 90,
+                    color: 'rgba(225,225,225,0.9)', size: 5
+                }));
+            }
+            // whoever is home, looking out of the windows
+            for (let i = 0; i < this.residents.length && i < 4; i++) {
+                let c = this.residents[i];
+                let wx = x + (i % 2 === 0 ? -31 : 31);
+                let bob = Math.sin(frameCount * 0.045 + i * 1.9) * 2;
+                ctx.save();
+                ctx.beginPath(); ctx.rect(wx - 11, y - 58, 22, 20); ctx.clip();
+                drawMiniChicken(wx + (i > 1 ? 5 : -4), y - 38 + bob, 7, i % 2 ? -1 : 1, 0,
+                                c.crazy ? c.bodyColor : '#ffffff');
+                ctx.restore();
+            }
+            // and one at the door, seeing them off
+            if (this.residents.length > 4) {
+                drawMiniChicken(x, y - 2, 7, Math.sin(frameCount * 0.02) > 0 ? 1 : -1,
+                                frameCount * 0.08, '#ffffff');
+            }
+        }
+
+        // --- the market stall ---
+        drawMarket() {
+            let x = this.x, y = this.y;
+            drawShadow(x, y, 52, 13);
+            // back posts and counter
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(x - 44, y - 4); ctx.lineTo(x - 44, y - 66);
+            ctx.moveTo(x + 44, y - 4); ctx.lineTo(x + 44, y - 66);
+            ctx.stroke();
+            // striped awning with a scalloped edge
+            const AW = ['#d8443c', '#f4ede0'];
+            for (let i = 0; i < 8; i++) {
+                ctx.fillStyle = AW[i % 2];
+                ctx.beginPath();
+                ctx.moveTo(x - 52 + i * 13, y - 66);
+                ctx.lineTo(x - 52 + (i + 1) * 13, y - 66);
+                ctx.lineTo(x - 50 + (i + 1) * 12.5, y - 50);
+                ctx.lineTo(x - 50 + i * 12.5, y - 50);
+                ctx.closePath(); ctx.fill();
+                ctx.beginPath();
+                ctx.arc(x - 44 + i * 12.5, y - 50, 6.2, 0, Math.PI);
+                ctx.fill();
+            }
+            ctx.fillStyle = '#8a6a3a'; ctx.fillRect(x - 54, y - 69, 108, 4);
+            // counter top and front boards
+            ctx.fillStyle = '#c69b5f'; ctx.fillRect(x - 48, y - 30, 96, 7);
+            ctx.fillStyle = '#a17c46'; ctx.fillRect(x - 46, y - 23, 92, 23);
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 1;
+            for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.moveTo(x + i * 18, y - 23); ctx.lineTo(x + i * 18, y); ctx.stroke(); }
+            // sacks of corn on the counter -- they empty as the stock runs down
+            let sacks = Math.max(0, Math.min(4, Math.round(this.stock / 5)));
+            for (let i = 0; i < sacks; i++) {
+                let sx = x - 33 + i * 18;
+                ctx.fillStyle = '#d8c49a';
+                ctx.beginPath(); ctx.ellipse(sx, y - 36, 8, 9, 0, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = '#bda877';
+                ctx.beginPath(); ctx.ellipse(sx, y - 43, 4.5, 3, 0, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = '#ffcc00';
+                for (let k = 0; k < 3; k++) {
+                    ctx.beginPath();
+                    ctx.ellipse(sx - 3 + k * 3, y - 45 - (k % 2) * 2, 1.8, 1.1, 0, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+            // a pair of scales at the end of the counter
+            ctx.strokeStyle = '#8a94a0'; ctx.lineWidth = 1.5;
+            let tilt = Math.sin(frameCount * 0.04) * 2;
+            ctx.beginPath();
+            ctx.moveTo(x + 36, y - 30); ctx.lineTo(x + 36, y - 46);
+            ctx.moveTo(x + 28, y - 46 - tilt); ctx.lineTo(x + 44, y - 46 + tilt);
+            ctx.stroke();
+            ctx.fillStyle = '#9aa4ae';
+            ctx.beginPath(); ctx.ellipse(x + 28, y - 44 - tilt, 4, 1.6, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(x + 44, y - 44 + tilt, 4, 1.6, 0, 0, Math.PI * 2); ctx.fill();
+            // the sign
+            ctx.fillStyle = '#f4ede0'; ctx.fillRect(x - 26, y - 64, 52, 15);
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 1.5; ctx.strokeRect(x - 26, y - 64, 52, 15);
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#7a4a20';
+            ctx.font = 'bold 10px "Courier New", monospace';
+            ctx.fillText('CORN', x, y - 53);
+            ctx.textAlign = 'left';
+            // the chicken minding the stall
+            if (this.done) {
+                drawMiniChicken(x + 8, y - 30, 8, -1, frameCount * 0.05, '#fff0c0');
+            }
+        }
+
+        // --- the merry-go-round ---
+        drawCarousel() {
+            let x = this.x, y = this.y;
+            drawShadow(x, y, 60, 17);
+            const RX = 52, RY = 19;
+            // decking
+            ctx.fillStyle = '#c9a24a';
+            ctx.beginPath(); ctx.ellipse(x, y - 6, RX, RY, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#a8863a';
+            ctx.beginPath(); ctx.ellipse(x, y - 2, RX, RY, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#c9a24a';
+            ctx.beginPath(); ctx.ellipse(x, y - 6, RX, RY, 0, 0, Math.PI * 2); ctx.fill();
+            // centre column
+            ctx.fillStyle = '#e0d0a8'; ctx.fillRect(x - 5, y - 82, 10, 76);
+            ctx.fillStyle = '#c8b488'; ctx.fillRect(x + 1, y - 82, 4, 76);
+            // horses, drawn back-to-front so the near ones overlap the far ones
+            let order = [];
+            for (let i = 0; i < 6; i++) {
+                let a = this.spin + (i / 6) * Math.PI * 2;
+                order.push({ i: i, a: a, dy: Math.sin(a) * RY });
+            }
+            order.sort((p, q) => p.dy - q.dy);
+            for (let o of order) {
+                let hx = x + Math.cos(o.a) * RX;
+                let hy = y - 6 + o.dy;
+                let rise = Math.sin(this.spin * 3 + o.i * 1.1) * 7;
+                let dir = Math.sin(o.a) > 0 ? 1 : -1;
+                // brass pole
+                ctx.strokeStyle = '#e8c24a'; ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(hx, y - 78); ctx.stroke();
+                // the horse
+                ctx.save();
+                ctx.translate(hx, hy - 22 + rise);
+                ctx.scale(dir, 1);
+                ctx.fillStyle = o.i % 2 ? '#f4ede0' : '#e8a0b4';
+                ctx.beginPath(); ctx.ellipse(0, 0, 13, 7, 0, 0, Math.PI * 2); ctx.fill();
+                ctx.beginPath(); ctx.ellipse(9, -8, 5, 6, 0.5, 0, Math.PI * 2); ctx.fill();
+                ctx.beginPath(); ctx.moveTo(11, -12); ctx.lineTo(19, -13); ctx.lineTo(12, -6); ctx.closePath(); ctx.fill();
+                ctx.strokeStyle = o.i % 2 ? '#e0d2b8' : '#d98ca2'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+                ctx.beginPath();
+                ctx.moveTo(-6, 5); ctx.lineTo(-8, 14);
+                ctx.moveTo(6, 5); ctx.lineTo(8, 14);
+                ctx.stroke(); ctx.lineCap = 'butt';
+                ctx.fillStyle = '#c8536a';
+                ctx.beginPath(); ctx.moveTo(4, -8); ctx.lineTo(-4, -14); ctx.lineTo(-2, -5); ctx.closePath(); ctx.fill();
+                ctx.fillStyle = '#000';
+                ctx.beginPath(); ctx.arc(14, -10, 1.3, 0, Math.PI * 2); ctx.fill();
+                ctx.restore();
+                // and whoever is riding it
+                let rider = this.riders[o.i];
+                if (rider && !rider.dead) {
+                    drawMiniChicken(hx, hy - 30 + rise, 7.5, dir, frameCount * 0.12 + o.i,
+                                    rider.crazy ? rider.bodyColor : '#ffffff');
+                }
+            }
+            // striped canopy
+            for (let i = 0; i < 10; i++) {
+                let a0 = (i / 10) * Math.PI * 2, a1 = ((i + 1) / 10) * Math.PI * 2;
+                ctx.fillStyle = i % 2 ? '#d8443c' : '#f4ede0';
+                ctx.beginPath();
+                ctx.moveTo(x, y - 100);
+                ctx.lineTo(x + Math.cos(a0) * 62, y - 76 + Math.sin(a0) * 21);
+                ctx.lineTo(x + Math.cos(a1) * 62, y - 76 + Math.sin(a1) * 21);
+                ctx.closePath(); ctx.fill();
+            }
+            ctx.fillStyle = '#c9a24a';
+            for (let i = 0; i < 12; i++) {
+                let a = (i / 12) * Math.PI * 2;
+                ctx.beginPath();
+                ctx.arc(x + Math.cos(a) * 61, y - 74 + Math.sin(a) * 21, 4, 0, Math.PI);
+                ctx.fill();
+            }
+            // finial and pennant
+            ctx.fillStyle = '#e8c24a';
+            ctx.beginPath(); ctx.arc(x, y - 103, 5, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(x, y - 106); ctx.lineTo(x, y - 122); ctx.stroke();
+            ctx.fillStyle = '#4dd2ff';
+            let fw = Math.sin(frameCount * 0.11) * 3;
+            ctx.beginPath();
+            ctx.moveTo(x, y - 122); ctx.lineTo(x + 18, y - 117 + fw); ctx.lineTo(x, y - 112);
+            ctx.closePath(); ctx.fill();
+        }
+
+        // --- the ferris wheel ---
+        drawFerris() {
+            let x = this.x, y = this.y;
+            const R = 66;
+            let cy = y - R - 26;
+            drawShadow(x, y, 46, 12);
+            // A-frame
+            ctx.strokeStyle = '#7f8792'; ctx.lineWidth = 5;
+            ctx.beginPath();
+            ctx.moveTo(x - 34, y); ctx.lineTo(x, cy);
+            ctx.moveTo(x + 34, y); ctx.lineTo(x, cy);
+            ctx.stroke();
+            ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(x - 20, y - 34); ctx.lineTo(x + 20, y - 34); ctx.stroke();
+            // rim
+            ctx.strokeStyle = '#d8443c'; ctx.lineWidth = 4;
+            ctx.beginPath(); ctx.arc(x, cy, R, 0, Math.PI * 2); ctx.stroke();
+            ctx.strokeStyle = '#f4ede0'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.arc(x, cy, R - 6, 0, Math.PI * 2); ctx.stroke();
+            // spokes
+            ctx.strokeStyle = 'rgba(244,237,224,0.85)'; ctx.lineWidth = 2;
+            ctx.beginPath();
+            for (let i = 0; i < 8; i++) {
+                let a = this.spin + (i / 8) * Math.PI * 2;
+                ctx.moveTo(x, cy);
+                ctx.lineTo(x + Math.cos(a) * R, cy + Math.sin(a) * R);
+            }
+            ctx.stroke();
+            // hub
+            ctx.fillStyle = '#e8c24a';
+            ctx.beginPath(); ctx.arc(x, cy, 8, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#8a6a3a';
+            ctx.beginPath(); ctx.arc(x, cy, 3.5, 0, Math.PI * 2); ctx.fill();
+            // gondolas -- they hang level however far round the wheel has gone
+            const CAR = ['#4dd2ff', '#ffd23b', '#8aff6b', '#c58bff', '#ff9b54', '#ff5a7a', '#4dd2ff', '#ffd23b'];
+            for (let i = 0; i < 8; i++) {
+                let a = this.spin + (i / 8) * Math.PI * 2;
+                let gx = x + Math.cos(a) * R;
+                let gy = cy + Math.sin(a) * R;
+                let swing = Math.sin(this.spin * 2 + i) * 0.09;
+                ctx.save();
+                ctx.translate(gx, gy);
+                ctx.rotate(swing);
+                ctx.strokeStyle = '#7f8792'; ctx.lineWidth = 1.5;
+                ctx.beginPath(); ctx.moveTo(-6, 0); ctx.lineTo(-4, 7); ctx.moveTo(6, 0); ctx.lineTo(4, 7); ctx.stroke();
+                ctx.fillStyle = CAR[i];
+                ctx.beginPath();
+                ctx.moveTo(-9, 7); ctx.lineTo(9, 7); ctx.lineTo(7, 20); ctx.lineTo(-7, 20);
+                ctx.closePath(); ctx.fill();
+                ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillRect(-9, 13, 18, 3);
+                let rider = this.riders[i];
+                if (rider && !rider.dead) {
+                    ctx.save();
+                    ctx.beginPath(); ctx.rect(-9, 0, 18, 14); ctx.clip();
+                    drawMiniChicken(0, 12, 7, i % 2 ? 1 : -1, frameCount * 0.1 + i,
+                                    rider.crazy ? rider.bodyColor : '#ffffff');
+                    ctx.restore();
+                }
+                ctx.restore();
+            }
+            // bunting on top
+            ctx.fillStyle = '#ffd23b';
+            let fw = Math.sin(frameCount * 0.12) * 3;
+            ctx.beginPath();
+            ctx.moveTo(x, cy - R - 4); ctx.lineTo(x + 16, cy - R + 1 + fw); ctx.lineTo(x, cy - R + 6);
+            ctx.closePath(); ctx.fill();
         }
 
         // --- the aeroplane shed ---
