@@ -176,7 +176,7 @@
 
     // Rabbits only bother showing up once the field is worth raiding
     const RABBIT_THRESHOLD = 3;
-    const RABBIT_MAX = 2;
+    const RABBIT_MAX = 4;
     let nextRabbitAt = 60 * 6;
     let grassStolen = 0;
 
@@ -554,6 +554,7 @@
     let chickensLost = 0;
     let chickensVaporised = 0;
     let foxesZapped = 0;
+    let garrisonRouts = 0;   // predators seen off by the troops
     let flash = 0;          // white screen flash from a lightning strike
     let nextBearAt = 60 * (25 + Math.random() * 45);
     let nextFlockAt = 60 * (5 + Math.random() * 8);
@@ -630,7 +631,7 @@
     let PLUMP_THRESHOLD = 1.22;       // a chicken this round counts as "plump"
     let WIN_PLUMP = 300;              // this many plump chickens at once = you win!
     let MAX_FATNESS = 1.5;            // and no chicken ever gets rounder than this
-    let FATTEN_PER_KERNEL = 0.012;    // ~18 kernels to make one hen properly plump
+    let FATTEN_PER_KERNEL = 0.0132;   // ~17 kernels to make one hen properly plump
     let METAB_PER_FRAME = 0.00002;    // and she slowly slims again, so keep feeding
     // How switched-on the hens are. Lower = dumber = they blunder into hazards
     // unless you keep corn down somewhere safe to hold their attention.
@@ -1353,6 +1354,7 @@
         updateJob() {
             if (this.job === 'build')  return this.doBuild();
             if (this.job === 'guard')  return this.doGuard();
+            if (this.job === 'soldier') return this.doSoldier();
             if (this.job === 'sit')    return this.doSit();
             if (this.job === 'soccer') return this.doSoccer();
             if (this.job === 'shop')   return this.doShop();
@@ -1421,6 +1423,64 @@
                 this.moveTo(clampX(canvas.width / 2 + Math.cos(this.patrolT) * canvas.width * 0.33),
                             clampY((playArea.minY + playArea.maxY) / 2 + Math.sin(this.patrolT) * 140),
                             this.baseSpeed * 0.85);
+            }
+            return true;
+        }
+
+        // The garrison. Drilled, armed with a spear, and a great deal harder
+        // to shake off than the pitchfork lot -- they hold the line instead of
+        // panicking, and they very rarely lose.
+        doSoldier() {
+            let site = this.site;
+            if (!site || !site.done) { releaseJob(this); return false; }
+            if (this.guardCd > 0) this.guardCd--;
+            if (this.jab > 0) this.jab--;
+            this.walkCycle += 0.32;
+            let best = null, bestD = 660;
+            for (let pr of predators) {
+                if (pr.scared || pr.hasChicken) continue;
+                let d = dist(this.x, this.y, pr.x, pr.y);
+                if (d < bestD) { bestD = d; best = pr; }
+            }
+            if (best && this.guardCd <= 0) {
+                // Run to where the kill is about to happen, not to where the
+                // animal is now -- chasing its tail never gets you there in time.
+                let ix = best.x, iy = best.y;
+                let mark = best.targetChicken;
+                if (mark && !mark.dead) {
+                    ix = (best.x + mark.x * 2) / 3;
+                    iy = (best.y + mark.y * 2) / 3;
+                }
+                this.moveTo(ix, iy, SOLDIER_CHARGE);
+                this.alarm = 0;
+                if (bestD < 58) {
+                    this.guardCd = 70;
+                    this.jab = 22;
+                    if (Math.random() < 0.85) {
+                        best.scare();
+                        foxesZapped++; garrisonRouts++; addScore(200);
+                        showBanner('THE GARRISON DRIVES IT OFF!', '#8aff6b');
+                        sndSparkle();
+                        puff(best.x, best.y, 16, '#ffe14d', 2.8);
+                    } else {
+                        // a bad day at the office -- fall back and re-form
+                        puff(this.x, this.y, 6, '#c8d0d8', 1.6);
+                        this.guardCd = 110;
+                        let back = pickEscapeTarget(this.x, this.y, best.x, best.y, 90);
+                        this.moveTo(back.x, back.y, this.baseSpeed * 1.4);
+                    }
+                }
+            } else {
+                // Each soldier holds his own sector, so wherever something comes
+                // over the fence there is already somebody standing near it.
+                let n = Math.max(1, site.troops.length);
+                let sector = (this.slot / n) * Math.PI * 2;
+                let cx = canvas.width / 2 + Math.cos(sector) * canvas.width * 0.35;
+                let cy = (playArea.minY + playArea.maxY) / 2 + Math.sin(sector) * 150;
+                this.patrolT = (this.patrolT === undefined ? Math.random() * 6.283 : this.patrolT) + 0.021;
+                this.moveTo(clampX(cx + Math.cos(this.patrolT) * 72),
+                            clampY(cy + Math.sin(this.patrolT) * 40),
+                            this.baseSpeed * 0.9);
             }
             return true;
         }
@@ -1618,6 +1678,13 @@
                 ctx.translate(size * 0.55, -size * 0.15);
                 ctx.rotate(-0.55 - Math.sin(this.workCycle) * (this.atPost ? 1.0 : 0.15));
                 drawTool(this.tool, size);
+                ctx.restore();
+            } else if (this.job === 'soldier') {
+                drawSoldierHelmet(size);
+                ctx.save();
+                ctx.translate(size * 0.75, -size * 0.1);
+                ctx.rotate(this.jab > 0 ? 1.15 : 0.24 + Math.sin(this.walkCycle * 0.5) * 0.06);
+                drawSpear(size);
                 ctx.restore();
             } else if (this.job === 'guard') {
                 drawHelmet(size);
@@ -2802,17 +2869,24 @@
     // other side. There is no reason for it and no way to stop it.
     function triggerRabbitStampede() {
         let dir = Math.random() > 0.5 ? 1 : -1;
-        let n = 14 + Math.floor(Math.random() * 8);
+        let n = 26 + Math.floor(Math.random() * 12);
         showBanner('RABBIT STAMPEDE!', '#f0e2cc');
+        // They must all start INSIDE the 70px despawn margin. Queuing them up
+        // further back does not stagger their arrival -- the cleanup pass wipes
+        // them on their first frame, which is why a stampede of thirty rabbits
+        // used to turn up as one. So: a shallow bank off the edge, spread over
+        // the full depth of the field, at mixed speeds so they fan out.
         for (let i = 0; i < n; i++) {
             let r = new Rabbit();
             r.swarm = true;
-            r.speed = 3.2 + Math.random() * 1.8;
+            r.speed = 3.0 + Math.random() * 2.2;
             r.dir = dir;
             r.facingDir = dir;
-            r.x = dir === 1 ? -60 - i * 34 : canvas.width + 60 + i * 34;
+            let back = 8 + (i % 7) * 7 + Math.random() * 5;      // 8..55, safely inside
+            r.x = dir === 1 ? -back : canvas.width + back;
             r.exitX = dir === 1 ? canvas.width + 170 : -170;
-            r.y = clampY(playArea.minY + Math.random() * (playArea.maxY - playArea.minY));
+            r.y = clampY(playArea.minY + 8 +
+                         ((i * 137) % 100) / 100 * (playArea.maxY - playArea.minY - 16));
             r.state = 'leave';
             rabbits.push(r);
         }
@@ -3257,6 +3331,9 @@
     let plane = null;
 
     const GUARD_AT = 110, GUARD_COUNT = 5;
+    const GARRISON = 8;               // soldiers the barracks keeps in the field
+    const SOLDIER_CHARGE = 5.6;       // must outrun the gator (4.4) or he never
+                                      // reaches the fight in time to matter
     const BALL_AT = 100, BALL_SQUAD = 8;
 
     // How long a shift lasts, in seconds: [minimum, extra at random].
@@ -3267,6 +3344,7 @@
         patrol: [26, 16],
         sit:    [24, 18],
         guard:  [34, 22],
+        soldier:[46, 26],   // a proper tour of duty
         soccer: [26, 20],
         ride:   [20, 16],   // a few turns of the wheel, then off to find lunch
         shop:   [45, 15]    // only a backstop -- they leave once they're served
@@ -3287,6 +3365,7 @@
         { id: 'barn',   key: 'barn',   need: 78,  x: 432,  y: 320, w: 104, h: 132, crew: 6, work: 60 * 150, name: 'BARN'      },
         { id: 'house',  key: 'house',  need: 102, x: 1006, y: 330, w: 76,  h: 116, crew: 5, work: 60 * 118, name: 'HOUSE'     },
         { id: 'ride',   key: 'ride',   need: 132, x: 588,  y: 508, w: 66,  h: 106, crew: 5, work: 60 * 124, name: 'MERRY-GO-ROUND' },
+        { id: 'barrk',  key: 'barrk',  need: 118, x: 1160, y: 340, w: 72,  h: 96,  crew: 5, work: 60 * 116, name: 'BARRACKS'  },
         { id: 'castle', key: 'castle', need: 164, x: 752,  y: 372, w: 130, h: 132, crew: 8, work: 60 * 230, name: 'CASTLE'    },
         { id: 'ferris', key: 'ferris', need: 196, x: 906,  y: 556, w: 84,  h: 124, crew: 6, work: 60 * 168, name: 'FERRIS WHEEL' },
         { id: 'coast',  key: 'coast',  need: 216, x: 190,  y: 656, w: 88,  h: 100, crew: 6, work: 60 * 152, name: 'ROLLER COASTER' },
@@ -3346,7 +3425,7 @@
         if (!c || !c.job) return;
         let st = c.site;
         if (st) {
-            for (let list of [st.crew, st.residents, st.patrol, st.sitters, st.riders, st.shoppers]) {
+            for (let list of [st.crew, st.residents, st.patrol, st.sitters, st.riders, st.shoppers, st.troops]) {
                 let i = list.indexOf(c);
                 if (i >= 0) list.splice(i, 1);
             }
@@ -3364,23 +3443,50 @@
         ctx.save();
         ctx.translate(x, y - Math.abs(Math.sin(cycle)) * 1.8);
         ctx.scale(dir, 1);
-        ctx.strokeStyle = '#ffa500'; ctx.lineWidth = 1.5;
+        // legs
+        ctx.strokeStyle = '#ff9000'; ctx.lineWidth = Math.max(1.5, s * 0.16);
         ctx.beginPath();
         ctx.moveTo(-s * 0.2, s * 0.3); ctx.lineTo(-s * 0.2 + Math.sin(cycle) * s * 0.35, s * 0.85);
         ctx.moveTo(s * 0.2, s * 0.3);  ctx.lineTo(s * 0.2 - Math.sin(cycle) * s * 0.35, s * 0.85);
         ctx.stroke();
+        // tail feathers -- the silhouette is half of what makes it a chicken
         ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.55, -s * 0.35);
+        ctx.lineTo(-s * 1.25, -s * 1.05);
+        ctx.lineTo(-s * 1.05, -s * 0.15);
+        ctx.closePath(); ctx.fill();
+        // body
         ctx.beginPath();
         ctx.moveTo(s, 0); ctx.lineTo(-s * 0.8, -s * 0.7); ctx.lineTo(-s * 0.6, s * 0.5);
         ctx.closePath(); ctx.fill();
-        ctx.fillStyle = '#ffa500';
-        ctx.beginPath(); ctx.moveTo(s - 1, -1); ctx.lineTo(s + s * 0.45, 1); ctx.lineTo(s - 1, 3); ctx.fill();
-        ctx.fillStyle = '#cc0000';
+        // a wing, so it isn't a smooth blob
+        ctx.fillStyle = 'rgba(0,0,0,0.10)';
+        ctx.beginPath(); ctx.ellipse(-s * 0.1, -s * 0.1, s * 0.42, s * 0.26, -0.25, 0, Math.PI * 2); ctx.fill();
+        // beak -- long enough to be unmistakable
+        ctx.fillStyle = '#ff9000';
         ctx.beginPath();
-        ctx.moveTo(s - s * 0.6, -s * 0.4); ctx.lineTo(s - s * 0.35, -s * 0.8); ctx.lineTo(s - s * 0.05, -s * 0.3);
+        ctx.moveTo(s * 0.86, -s * 0.16);
+        ctx.lineTo(s + Math.max(3.2, s * 0.62), s * 0.06);
+        ctx.lineTo(s * 0.86, s * 0.3);
+        ctx.closePath(); ctx.fill();
+        // comb: three bumps, never smaller than a visible pixel
+        let cb = Math.max(1.6, s * 0.26);
+        ctx.fillStyle = '#e01e1e';
+        for (let i = 0; i < 3; i++) {
+            ctx.beginPath();
+            ctx.arc(s * 0.32 + i * cb * 0.9, -s * 0.72, cb * 0.62, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        // wattle under the beak
+        ctx.beginPath();
+        ctx.arc(s * 0.82, s * 0.42, Math.max(1.3, s * 0.2), 0, Math.PI * 2);
         ctx.fill();
+        // eye, with a white so it reads at any size
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath(); ctx.arc(s * 0.5, -s * 0.24, Math.max(1.7, s * 0.24), 0, Math.PI * 2); ctx.fill();
         ctx.fillStyle = '#000';
-        ctx.fillRect(s - s * 0.5, -s * 0.22, 1.6, 1.6);
+        ctx.beginPath(); ctx.arc(s * 0.54, -s * 0.24, Math.max(0.9, s * 0.13), 0, Math.PI * 2); ctx.fill();
         ctx.restore();
     }
 
@@ -3425,6 +3531,33 @@
             ctx.lineWidth = u * 1.1;
             ctx.beginPath(); ctx.arc(0, -u * 8.4, u * 1.9, 0.6, 5.7); ctx.stroke();
         }
+    }
+    // A little tin helmet with a cheek guard and a red crest
+    function drawSoldierHelmet(s) {
+        ctx.fillStyle = '#b9c2cc';
+        ctx.beginPath(); ctx.arc(s * 0.3, -s * 0.58, s * 0.44, Math.PI, 0); ctx.fill();
+        ctx.fillStyle = '#98a2ac';
+        ctx.fillRect(s * 0.3 - s * 0.58, -s * 0.62, s * 1.16, s * 0.15);
+        ctx.fillRect(s * 0.62, -s * 0.62, s * 0.12, s * 0.4);      // cheek guard
+        ctx.fillStyle = '#d83a3a';                                  // crest
+        for (let i = 0; i < 3; i++) {
+            ctx.beginPath();
+            ctx.arc(s * 0.14 + i * s * 0.16, -s * 1.02 + i * s * 0.05, s * 0.15, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+    function drawSpear(s) {
+        let u = Math.max(0.9, s * 0.13);
+        ctx.strokeStyle = '#a9743d'; ctx.lineWidth = u * 1.1;
+        ctx.beginPath(); ctx.moveTo(0, u * 5); ctx.lineTo(0, -u * 10); ctx.stroke();
+        ctx.fillStyle = '#dde4ec';
+        ctx.beginPath();
+        ctx.moveTo(0, -u * 15.5); ctx.lineTo(-u * 1.5, -u * 10); ctx.lineTo(u * 1.5, -u * 10);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#c8353f';                                  // pennant
+        ctx.beginPath();
+        ctx.moveTo(u * 0.5, -u * 9.4); ctx.lineTo(u * 4.4, -u * 8.2); ctx.lineTo(u * 0.5, -u * 6.6);
+        ctx.closePath(); ctx.fill();
     }
     function drawPitchfork(s) {
         let u = s * 0.13;
@@ -3532,7 +3665,7 @@
             this.work = 0;
             this.done = false;
             this.crew = []; this.residents = []; this.patrol = []; this.sitters = [];
-            this.riders = []; this.shoppers = [];
+            this.riders = []; this.shoppers = []; this.troops = [];
             this.spin = Math.random() * 6.283;      // rides turn from wherever
             this.carU = Math.random();              // where the coaster train is
             this.track = null;                      // built the first time it's drawn
@@ -3567,8 +3700,10 @@
                     c.releaseFood();
                     if (job === 'build') { c.tool = (Math.random() * 5) | 0; c.workCycle = Math.random() * 6; }
                     c.stayCd = 60 * (SHIFT[job][0] + Math.random() * SHIFT[job][1]);
-                    // indoors means out of reach of anything with teeth
-                    if (job === 'inside' || job === 'patrol') {
+                    // Indoors -- or strapped into a ride -- means out of reach of
+                    // anything with teeth. The building draws them from here on,
+                    // so they must stop being drawn as loose birds too.
+                    if (job === 'inside' || job === 'patrol' || job === 'ride') {
                         c.hidden = true; c.safe = true;
                         c.x = this.x; c.y = this.y - 2;   // they live here now
                     }
@@ -3600,6 +3735,7 @@
                     this.staff(this.patrol, 'patrol', 6);
                     this.staff(this.residents, 'inside', 10);
                 } else if (this.key === 'fire') this.staff(this.sitters, 'sit', 6);
+                else if (this.key === 'barrk') this.staff(this.troops, 'soldier', GARRISON);
                 else if (this.key === 'ferris') { this.staff(this.riders, 'ride', 8); this.spin += 0.009; }
                 else if (this.key === 'ride')   { this.staff(this.riders, 'ride', 6); this.spin += 0.016; }
                 else if (this.key === 'coast') {
@@ -3750,6 +3886,7 @@
             else if (this.key === 'ride') this.drawCarousel();
             else if (this.key === 'ferris') this.drawFerris();
             else if (this.key === 'coast') this.drawCoaster();
+            else if (this.key === 'barrk') this.drawBarracks();
             else this.drawHangar();
         }
 
@@ -3758,6 +3895,7 @@
             else if (this.key === 'castle') this.drawCastleLife();
             else if (this.key === 'coop') this.drawCoopLife();
             else if (this.key === 'house') this.drawHouseLife();
+            else if (this.key === 'barrk') this.drawBarracksLife();
         }
 
         // where the next customer in the queue should stand
@@ -4240,7 +4378,7 @@
                 // and whoever is riding it
                 let rider = this.riders[o.i];
                 if (rider && !rider.dead) {
-                    drawMiniChicken(hx, hy - 30 + rise, 7.5, dir, frameCount * 0.12 + o.i,
+                    drawMiniChicken(hx, hy - 31 + rise, 9.5, dir, frameCount * 0.12 + o.i,
                                     rider.crazy ? rider.bodyColor : '#ffffff');
                 }
             }
@@ -4326,8 +4464,8 @@
                 let rider = this.riders[i];
                 if (rider && !rider.dead) {
                     ctx.save();
-                    ctx.beginPath(); ctx.rect(-9, 0, 18, 14); ctx.clip();
-                    drawMiniChicken(0, 12, 7, i % 2 ? 1 : -1, frameCount * 0.1 + i,
+                    ctx.beginPath(); ctx.rect(-11, -4, 22, 18); ctx.clip();
+                    drawMiniChicken(0, 12, 9, i % 2 ? 1 : -1, frameCount * 0.1 + i,
                                     rider.crazy ? rider.bodyColor : '#ffffff');
                     ctx.restore();
                 }
@@ -4428,7 +4566,7 @@
                 for (let r = 0; r < 2; r++) {
                     let rider = this.riders[c * 2 + r];
                     if (!rider || rider.dead) continue;
-                    let rx = -3 + r * 7;
+                    let rx = -4 + r * 8;
                     ctx.save();
                     ctx.translate(rx, -7);
                     if (dropping) {   // wings in the air
@@ -4438,7 +4576,7 @@
                         ctx.beginPath();
                         ctx.moveTo(2, -1); ctx.lineTo(6, -9); ctx.lineTo(0, -3); ctx.closePath(); ctx.fill();
                     }
-                    drawMiniChicken(0, 2, 5.5, r ? 1 : -1, dropping ? frameCount * 0.5 : 0,
+                    drawMiniChicken(0, 1, 8, r ? 1 : -1, dropping ? frameCount * 0.5 : 0,
                                     rider.crazy ? rider.bodyColor : '#ffffff');
                     ctx.restore();
                 }
@@ -4454,6 +4592,110 @@
                 ctx.beginPath(); ctx.arc(5, 4, 2.2, 0, Math.PI * 2); ctx.fill();
                 ctx.restore();
             }
+        }
+
+        // --- the barracks ---
+        drawBarracks() {
+            let x = this.x, y = this.y;
+            drawShadow(x, y, 60, 15);
+            // palisade of pointed logs either side
+            ctx.fillStyle = '#8a6a3a';
+            for (let i = 0; i < 5; i++) {
+                for (let sgn = -1; sgn <= 1; sgn += 2) {
+                    let px = x + sgn * (44 + i * 9);
+                    ctx.fillRect(px - 3.5, y - 26, 7, 26);
+                    ctx.beginPath();
+                    ctx.moveTo(px - 3.5, y - 26); ctx.lineTo(px, y - 32); ctx.lineTo(px + 3.5, y - 26);
+                    ctx.closePath(); ctx.fill();
+                }
+            }
+            // stone footing, timber walls above
+            ctx.fillStyle = '#8b8b82'; ctx.fillRect(x - 42, y - 16, 84, 16);
+            ctx.fillStyle = '#7d7d74';
+            for (let i = 0; i < 7; i++) ctx.fillRect(x - 40 + i * 12, y - 15, 10, 6);
+            ctx.fillStyle = '#a9743d'; ctx.fillRect(x - 42, y - 56, 84, 40);
+            ctx.strokeStyle = 'rgba(110,72,36,0.6)'; ctx.lineWidth = 1;
+            for (let i = 1; i < 5; i++) {
+                ctx.beginPath(); ctx.moveTo(x - 42, y - 56 + i * 8); ctx.lineTo(x + 42, y - 56 + i * 8); ctx.stroke();
+            }
+            // shingled roof
+            ctx.fillStyle = '#5d6570';
+            ctx.beginPath();
+            ctx.moveTo(x - 50, y - 54); ctx.lineTo(x, y - 84); ctx.lineTo(x + 50, y - 54);
+            ctx.closePath(); ctx.fill();
+            ctx.strokeStyle = 'rgba(35,42,50,0.55)'; ctx.lineWidth = 1;
+            for (let r = 1; r < 5; r++) {
+                let ry = y - 54 - r * 5.6, hw = 50 * (1 - r / 5.2);
+                ctx.beginPath(); ctx.moveTo(x - hw, ry); ctx.lineTo(x + hw, ry); ctx.stroke();
+            }
+            ctx.fillStyle = '#4a525c'; ctx.fillRect(x - 50, y - 56, 100, 3);
+            // doorway
+            ctx.fillStyle = '#2a1f16';
+            ctx.beginPath(); ctx.arc(x, y - 26, 12, Math.PI, 0); ctx.fill();
+            ctx.fillRect(x - 12, y - 26, 24, 26);
+            ctx.fillStyle = '#6b4a2e'; ctx.fillRect(x - 13, y - 40, 26, 3);
+            // two shuttered windows
+            for (let sgn = -1; sgn <= 1; sgn += 2) {
+                ctx.fillStyle = '#3a2a1a'; ctx.fillRect(x + sgn * 28 - 7, y - 48, 14, 12);
+                ctx.fillStyle = '#c69b5f'; ctx.fillRect(x + sgn * 28 - 8, y - 49, 3, 14);
+                ctx.fillRect(x + sgn * 28 + 5, y - 49, 3, 14);
+            }
+            // rack of spears against the left wall
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(x - 56, y - 4); ctx.lineTo(x - 56, y - 22); ctx.stroke();
+            for (let i = 0; i < 4; i++) {
+                let sx = x - 62 + i * 4;
+                ctx.strokeStyle = '#a9743d'; ctx.lineWidth = 1.4;
+                ctx.beginPath(); ctx.moveTo(sx, y - 2); ctx.lineTo(sx + 3, y - 34); ctx.stroke();
+                ctx.fillStyle = '#dde4ec';
+                ctx.beginPath();
+                ctx.moveTo(sx + 3, y - 39); ctx.lineTo(sx + 1.2, y - 33); ctx.lineTo(sx + 4.8, y - 33);
+                ctx.closePath(); ctx.fill();
+            }
+            // straw training dummy on the right, with a borrowed helmet
+            let dx = x + 58, sway = Math.sin(frameCount * 0.06) * 1.5;
+            ctx.strokeStyle = '#8a6a3a'; ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(dx, y - 2); ctx.lineTo(dx + sway, y - 26); ctx.stroke();
+            ctx.lineWidth = 2.5;
+            ctx.beginPath(); ctx.moveTo(dx - 9 + sway, y - 22); ctx.lineTo(dx + 9 + sway, y - 22); ctx.stroke();
+            ctx.fillStyle = '#d9c07a';
+            ctx.beginPath(); ctx.ellipse(dx + sway, y - 30, 7, 8, 0, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#b9c2cc';
+            ctx.beginPath(); ctx.arc(dx + sway, y - 33, 7, Math.PI, 0); ctx.fill();
+            // pennant over the door
+            let ft = frameCount * 0.1;
+            ctx.strokeStyle = '#6b4a2e'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(x, y - 84); ctx.lineTo(x, y - 106); ctx.stroke();
+            ctx.fillStyle = '#c8353f';
+            ctx.beginPath();
+            ctx.moveTo(x, y - 106);
+            ctx.quadraticCurveTo(x + 13, y - 104 + Math.sin(ft) * 3, x + 26, y - 100 + Math.sin(ft + 1) * 4);
+            ctx.lineTo(x + 26, y - 92 + Math.sin(ft + 1) * 4);
+            ctx.quadraticCurveTo(x + 13, y - 94 + Math.sin(ft) * 3, x, y - 94);
+            ctx.closePath(); ctx.fill();
+            // the sign
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#f4ede0'; ctx.fillRect(x - 27, y - 52, 54, 13);
+            ctx.fillStyle = '#7a4a20';
+            ctx.font = 'bold 9px "Courier New", monospace';
+            ctx.fillText('BARRACKS', x, y - 43);
+            ctx.textAlign = 'left';
+        }
+        drawBarracksLife() {
+            // a sentry marching back and forth across the doorway
+            let x = this.x, y = this.y;
+            let t = Math.sin(frameCount * 0.017);
+            let sx = x + t * 26;
+            let dir = Math.cos(frameCount * 0.017) > 0 ? 1 : -1;
+            drawMiniChicken(sx, y + 4, 8, dir, frameCount * 0.16, '#ffffff');
+            ctx.save();
+            ctx.translate(sx, y + 4);
+            ctx.scale(dir, 1);
+            drawSoldierHelmet(8);
+            ctx.translate(6, -1);
+            ctx.rotate(0.24);
+            drawSpear(8);
+            ctx.restore();
         }
 
         // --- the aeroplane shed ---
@@ -4845,7 +5087,7 @@
         nextStampedeAt = frameCount + 60 * 50;
         bigSackAnnounced = false;
         score = 0; scorePop = 0;
-        chickensLost = 0; foxesZapped = 0; chickensStarved = 0; chickensVaporised = 0;
+        chickensLost = 0; foxesZapped = 0; garrisonRouts = 0; chickensStarved = 0; chickensVaporised = 0;
         grassStolen = 0; cowMeals = 0; crazyDeparted = 0;
         boltCd = 0; boltDeny = 0; flash = 0; denyFlash = 0;
         banner = null;
@@ -5232,6 +5474,7 @@
             ['EATEN ' + chickensLost + '   ZAPPED BY YOU ' + chickensVaporised,
                 (chickensLost || chickensVaporised) ? '#ff8080' : '#FFD700'],
             ['SCARED OFF ' + foxesZapped + '   FLEW AWAY ' + crazyDeparted, '#9ad8ff'],
+            [garrisonRouts ? 'GARRISON ROUTED ' + garrisonRouts : '', '#8aff6b'],
             ['AT WORK ' + jobN + '   SAFE INDOORS ' + safeN, '#ffd8a0'],
             [building ? 'BUILDING ' + building.spec.name + ' ' + Math.round(building.t * 100) + '%'
                       : 'NEXT BUILD AT ' + (nextUp ? nextUp.need : moreAt) + ' CHICKENS',

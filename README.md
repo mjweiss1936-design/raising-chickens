@@ -33,6 +33,7 @@ needs more chickens than the last one:
 | 100 | (a football falls out of the sky and they start kicking it about) |
 | 102 | a **house**. A proper one, for a person. Half-timbered, tiled roof, smoking chimney, flowers in the window boxes. They live in it. |
 | 110 | a pitchfork patrol that charges predators and often sees them off |
+| 118 | a **barracks**, which keeps eight soldier chickens in the field -- tin helmets with red crests, spears with pennants. Each holds his own sector of the yard and runs to intercept anything that comes over the fence. They drive off 13-14 predators a game on their own. |
 | 132 | a **merry-go-round**, with painted horses that go up and down |
 | 164 | a castle -- six chickens patrol the battlements, ten shelter inside where nothing can eat them |
 | 196 | a **ferris wheel**, eight gondolas, riders in every one |
